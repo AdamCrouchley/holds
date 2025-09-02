@@ -1,0 +1,640 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Booking;
+use App\Models\Customer;
+use App\Models\Deposit;
+use App\Models\Payment;
+use App\Services\StripeService;
+use App\Services\VeVsApi;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Str;
+use Throwable;
+
+class PortalController extends Controller
+{
+    /**
+     * ---------------------------------------------------------------------
+     * Customer Login (passwordless magic-link)
+     * ---------------------------------------------------------------------
+     * Views expected:
+     * - resources/views/portal/login.blade.php
+     * - resources/views/portal/login-sent.blade.php
+     * - resources/views/portal/home.blade.php
+     * - resources/views/portal/dashboard.blade.php
+     * - (optional) resources/views/portal/booking.blade.php
+     */
+
+    /** GET /portal/login */
+    public function showLogin(Request $request)
+    {
+        // If already logged in, go straight to dashboard
+        if (Auth::guard('customer')->check() || $request->session()->has('portal_customer_id')) {
+            return redirect()->route('portal.dashboard');
+        }
+
+        // Capture an intended redirect (e.g. ?intended=/vevs/pay?ref=QT...)
+        $intended = (string) $request->query('intended', '');
+        if ($intended !== '') {
+            $request->session()->put('portal.intended', $intended);
+        }
+
+        return view('portal.login');
+    }
+
+    /** POST /portal/login  (request a magic-link) */
+    public function sendLoginLink(Request $request)
+    {
+        $data = $request->validate(['email' => 'required|email']);
+        $email = strtolower(trim($data['email']));
+
+        /** @var Customer|null $customer */
+        $customer = Customer::whereRaw('LOWER(email) = ?', [$email])->first();
+
+        // Always act like it worked (privacy), but create a record if we have a customer
+        if ($customer) {
+            $plain = Str::random(64);
+            $customer->login_token_hash = hash('sha256', $plain);
+            $customer->login_token_expires_at = now()->addMinutes(30);
+            $customer->save();
+
+            // Signed one-time login URL (also includes email to disambiguate)
+            $params = ['email' => $customer->email, 'token' => $plain];
+
+            // If we captured an intended URL earlier, carry it forward
+            if ($request->session()->has('portal.intended')) {
+                $params['intended'] = $request->session()->get('portal.intended');
+            }
+
+            $loginUrl = URL::temporarySignedRoute(
+                'portal.magic',
+                now()->addMinutes(30),
+                $params
+            );
+
+            // Send email (replace with a proper Mailable later)
+            try {
+                // For now, log the URL so you can test immediately
+                Log::info('[portal/login] Magic link', ['email' => $email, 'url' => $loginUrl]);
+
+                // Example stub (uncomment when mail is configured):
+                // Mail::raw("Hi! Click to sign in: {$loginUrl}", function ($m) use ($customer) {
+                //     $m->to($customer->email)->subject('Sign in to your booking portal');
+                // });
+            } catch (Throwable $e) {
+                Log::error('[portal/login] Mail failed', ['error' => $e->getMessage()]);
+            }
+        }
+
+        return view('portal.login-sent', ['email' => $email]);
+    }
+
+    /**
+     * GET /portal/magic/{token}?email=...&intended=...
+     * Finalizes login if the signed URL and token hash both validate.
+     */
+    public function magicLogin(Request $request, string $token)
+    {
+        // Verify signed URL
+        if (!$request->hasValidSignature()) {
+            abort(403, 'Invalid or expired link.');
+        }
+
+        $email = strtolower(trim((string) $request->query('email', '')));
+        /** @var Customer|null $customer */
+        $customer = Customer::whereRaw('LOWER(email) = ?', [$email])->first();
+
+        if (!$customer || empty($customer->login_token_hash) || empty($customer->login_token_expires_at)) {
+            abort(403, 'Invalid login token.');
+        }
+
+        if (now()->greaterThan(Carbon::parse($customer->login_token_expires_at))) {
+            abort(403, 'Login link has expired.');
+        }
+
+        if (!hash_equals($customer->login_token_hash, hash('sha256', $token))) {
+            abort(403, 'Invalid login token.');
+        }
+
+        // Success: protect against session fixation and store identity
+        $request->session()->regenerate();
+
+        // Login via the dedicated 'customer' guard (primary)
+        Auth::guard('customer')->login($customer, remember: true);
+
+        // Keep legacy session key for backward compatibility
+        $request->session()->put('portal_customer_id', $customer->id);
+
+        // Invalidate token
+        $customer->forceFill([
+            'login_token_hash' => null,
+            'login_token_expires_at' => null,
+        ])->save();
+
+        // Optional post-login redirect (e.g. to a /vevs/* URL)
+        $intended = (string) $request->query('intended', $request->session()->pull('portal.intended', ''));
+        if ($intended !== '' && str_starts_with($intended, '/')) {
+            return redirect()->to($intended);
+        }
+
+        return redirect()->route('portal.dashboard');
+    }
+
+    /** POST /portal/logout */
+    public function logout(Request $request)
+    {
+        // Logout guard + clear legacy session
+        Auth::guard('customer')->logout();
+        $request->session()->forget('portal_customer_id');
+
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        return redirect()->route('portal.login')->with('status', 'Signed out');
+    }
+
+    /**
+     * GET /p (requires auth:customer)
+     * Small landing/home page for authenticated customers.
+     */
+    public function home(Request $request)
+    {
+        $customer = Auth::guard('customer')->user();
+        if (! $customer) {
+            // if someone hits /p directly without auth, send them to login
+            return redirect()->route('portal.login');
+        }
+
+        return view('portal.home', ['customer' => $customer]);
+    }
+
+    /** GET /portal  (simple dashboard) */
+    public function dashboard(Request $request)
+    {
+        $customer = $this->requireCustomer($request);
+
+        $bookings = Booking::with('customer')
+            ->where('customer_id', $customer->id)
+            ->latest('start_at')
+            ->take(25)
+            ->get();
+
+        return view('portal.dashboard', compact('customer', 'bookings'));
+    }
+
+    /** GET /portal/bookings/{reference} (show one booking if owned) */
+    public function showMyBooking(Request $request, string $reference)
+    {
+        $customer = $this->requireCustomer($request);
+
+        $booking = Booking::with('customer')
+            ->where('reference', strtoupper($reference))
+            ->where('customer_id', $customer->id)
+            ->firstOrFail();
+
+        return view('portal.booking', compact('customer', 'booking'));
+    }
+
+    // ---------------------------------------------------------------------
+    // Existing public/token + VEVS landing flows
+    // ---------------------------------------------------------------------
+
+    /**
+     * Entry points (routes)
+     * - Token flows (existing):
+     *      GET /p/pay/{token}      -> payWithToken()
+     *      GET /p/hold/{token}     -> holdWithToken()
+     *      GET /p/manage/{token}   -> manageWithToken()
+     *
+     * - VEVS landing flows (no token, use ?ref=):
+     *      GET /vevs/pay?ref=QT...
+     *      GET /vevs/hold?ref=QT...
+     *      GET /vevs/manage?ref=QT...
+     */
+
+    /** Token route: deposit */
+    public function payWithToken(Request $request, string $token, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: $token);
+        return $this->runDepositFlow($booking, $stripe);
+    }
+
+    /** VEVS landing: deposit (expects ?ref=) */
+    public function payLanding(Request $request, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: null);
+        $this->authoriseIfLoggedIn($request, $booking); // optional ownership check
+        return $this->runDepositFlow($booking, $stripe);
+    }
+
+    /** Token route: hold */
+    public function holdWithToken(Request $request, string $token, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: $token);
+        return $this->runHoldFlow($booking, $stripe);
+    }
+
+    /** VEVS landing: hold (expects ?ref=) */
+    public function holdLanding(Request $request, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: null);
+        $this->authoriseIfLoggedIn($request, $booking);
+        return $this->runHoldFlow($booking, $stripe);
+    }
+
+    /** Token route: manage card */
+    public function manageWithToken(Request $request, string $token, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: $token);
+        return $this->runManageFlow($booking, $stripe);
+    }
+
+    /** VEVS landing: manage card (expects ?ref=) */
+    public function manageLanding(Request $request, StripeService $stripe)
+    {
+        $booking = $this->resolveBooking($request, token: null);
+        $this->authoriseIfLoggedIn($request, $booking);
+        return $this->runManageFlow($booking, $stripe);
+    }
+
+    public function paySubmit()    { return redirect()->route('home'); }
+    public function holdSubmit()   { return redirect()->route('home'); }
+    public function manageSubmit() { return redirect()->route('home'); }
+
+    // ---------------------------------------------------------------------
+    // Resolve + Flows
+    // ---------------------------------------------------------------------
+
+    /**
+     * Resolve a booking either by:
+     *  - portal token (existing /p/* routes), or
+     *  - VEVS reference via ?ref= (new /vevs/* landing routes).
+     *
+     * If a VEVS ref is provided and the booking doesn't exist locally,
+     * this will try to fetch it from the VEVS API and upsert it.
+     */
+    protected function resolveBooking(Request $request, ?string $token): Booking
+    {
+        if ($token) {
+            return Booking::with('customer')->where('portal_token', $token)->firstOrFail();
+        }
+
+        $ref = strtoupper(trim((string) $request->query('ref', '')));
+        abort_if($ref === '', 404, 'Missing booking reference (?ref=).');
+
+        // Try local
+        $booking = Booking::with('customer')->where('reference', $ref)->first();
+        if ($booking) {
+            return $booking;
+        }
+
+        // Else import from VEVS
+        try {
+            /** @var VeVsApi $vevs */
+            $vevs = app(VeVsApi::class);
+
+            if (method_exists($vevs, 'reservationByRef')) {
+                $row = $vevs->reservationByRef($ref);
+                if (!$row) {
+                    abort(404, 'Booking not found in VEVS.');
+                }
+
+                $booking = Booking::updateOrCreate(
+                    ['reference' => $ref],
+                    [
+                        'customer_id'    => $this->syncOrCreateCustomer($row)?->id,
+                        'vehicle'        => (string)($row['vehicle'] ?? ''),
+                        'status'         => (string)($row['status'] ?? 'pending'),
+                        'start_at'       => $this->safeCarbon($row['start_at'] ?? null),
+                        'end_at'         => $this->safeCarbon($row['end_at'] ?? null),
+                        'total_amount'   => (int)($row['total_amount_cents'] ?? 0),
+                        'deposit_amount' => (int)($row['deposit_amount_cents'] ?? 0),
+                        'hold_amount'    => (int)($row['hold_amount_cents'] ?? 0),
+                        'currency'       => strtoupper((string)($row['currency'] ?? 'NZD')),
+                        'portal_token'   => (string)($row['portal_token'] ?? (string)(Booking::where('reference', $ref)->value('portal_token') ?? '')),
+                        'meta'           => $row,
+                    ]
+                )->load('customer');
+
+                return $booking;
+            }
+
+            Log::warning('[portal/resolve] VeVsApi::reservationByRef() not available', ['ref' => $ref]);
+            abort(404, 'Booking not found.');
+        } catch (Throwable $e) {
+            Log::error('[portal/resolve] VEVS import failed', ['ref' => $ref, 'error' => $e->getMessage()]);
+            abort(502, 'Could not fetch booking from VEVS.');
+        }
+    }
+
+    /** Deposit collection flow (Stripe PaymentIntent w/ automatic payment methods, saves card). */
+    protected function runDepositFlow(Booking $booking, StripeService $stripe)
+    {
+        $booking->loadMissing('customer');
+        $customer = $booking->customer;
+
+        $stripeCustomerId = $this->ensureStripeCustomer($customer, $stripe);
+
+        $amount        = (int) $booking->deposit_amount;
+        $currencyLower = strtolower((string) $booking->currency ?: 'nzd');
+        $currencyUpper = strtoupper($currencyLower);
+        abort_if($amount <= 0, 422, 'No deposit amount configured.');
+
+        $payment = Payment::where('booking_id', $booking->id)
+            ->where('type', 'booking_deposit')
+            ->latest('id')
+            ->first();
+
+        if (!$payment) {
+            $payment = Payment::create([
+                'booking_id'  => $booking->id,
+                'customer_id' => $customer->id,
+                'type'        => 'booking_deposit',
+                'amount'      => $amount,
+                'currency'    => $currencyUpper,
+                'status'      => 'pending',
+            ]);
+        } else {
+            $payment->update(['amount' => $amount, 'currency' => $currencyUpper]);
+        }
+
+        if ($payment->stripe_payment_intent_id) {
+            $pi = $stripe->stripe->paymentIntents->retrieve($payment->stripe_payment_intent_id);
+            if ((int) $pi->amount !== $amount) {
+                $pi = $stripe->stripe->paymentIntents->update($pi->id, ['amount' => $amount]);
+            }
+        } else {
+            $pi = $stripe->stripe->paymentIntents->create(
+                [
+                    'amount'                    => $amount,
+                    'currency'                  => $currencyLower,
+                    'customer'                  => $stripeCustomerId,
+                    'automatic_payment_methods' => ['enabled' => true],
+                    'setup_future_usage'        => 'off_session',
+                    'description'               => "Booking deposit {$booking->reference}",
+                    'metadata'                  => [
+                        'booking_id'  => (string) $booking->id,
+                        'booking_ref' => $booking->reference,
+                        'payment_id'  => (string) $payment->id,
+                        'type'        => 'booking_deposit',
+                    ],
+                ],
+                ['idempotency_key' => 'portal_deposit_'.$booking->id.'_'.$amount]
+            );
+
+            $payment->update([
+                'stripe_payment_intent_id' => $pi->id,
+                'status'                   => 'pending',
+            ]);
+        }
+
+        Log::info('[portal/deposit] PI ready', [
+            'booking' => $booking->id,
+            'payment' => $payment->id,
+            'pi'      => $pi->id,
+            'amount'  => $amount,
+            'ref'     => $booking->reference,
+        ]);
+
+        return view('portal.pay', [
+            'booking'        => $booking,
+            'clientSecret'   => $pi->client_secret,
+            'publishableKey' => config('services.stripe.publishable_key'),
+        ]);
+    }
+
+    /** Security hold flow (Stripe manual-capture PaymentIntent). */
+    protected function runHoldFlow(Booking $booking, StripeService $stripe)
+    {
+        $booking->loadMissing('customer');
+        $customer = $booking->customer;
+
+        $amount        = (int) $booking->hold_amount;
+        $currencyLower = strtolower((string) $booking->currency ?: 'nzd');
+        $currencyUpper = strtoupper($currencyLower);
+        abort_if($amount <= 0, 422, 'Invalid hold amount.');
+
+        // Try off-session if default PM present
+        if ($customer->default_payment_method_id && $customer->stripe_customer_id) {
+            try {
+                $pi = $stripe->stripe->paymentIntents->create(
+                    [
+                        'amount'         => $amount,
+                        'currency'       => $currencyLower,
+                        'customer'       => $customer->stripe_customer_id,
+                        'payment_method' => $customer->default_payment_method_id,
+                        'off_session'    => true,
+                        'confirm'        => true,
+                        'capture_method' => 'manual',
+                        'description'    => "Security hold {$booking->reference}",
+                        'metadata'       => [
+                            'booking_id'  => (string) $booking->id,
+                            'booking_ref' => $booking->reference,
+                            'type'        => 'deposit_hold',
+                        ],
+                    ],
+                    ['idempotency_key' => 'hold_'.$booking->id.'_'.$amount]
+                );
+
+                Deposit::create([
+                    'booking_id'               => $booking->id,
+                    'customer_id'              => $customer->id,
+                    'amount'                   => $amount,
+                    'currency'                 => $currencyUpper,
+                    'stripe_payment_intent_id' => $pi->id,
+                    'status'                   => 'authorised',
+                    'authorised_at'            => now(),
+                    'expires_at'               => Carbon::now()->addDays(7),
+                ]);
+
+                Log::info('[portal/hold] authorised off-session', [
+                    'booking' => $booking->id,
+                    'pi'      => $pi->id,
+                    'amount'  => $amount,
+                    'ref'     => $booking->reference,
+                ]);
+
+                return view('portal.hold-result', [
+                    'success' => true,
+                    'booking' => $booking,
+                    'message' => 'Deposit authorised on your saved card.',
+                ]);
+            } catch (Throwable $e) {
+                Log::warning('[portal/hold] off-session auth failed; falling back', [
+                    'booking' => $booking->id,
+                    'error'   => $e->getMessage(),
+                    'ref'     => $booking->reference,
+                ]);
+            }
+        }
+
+        // Hosted flow
+        $pi = $stripe->stripe->paymentIntents->create(
+            [
+                'amount'                    => $amount,
+                'currency'                  => $currencyLower,
+                'customer'                  => $customer->stripe_customer_id ?: null,
+                'automatic_payment_methods' => ['enabled' => true],
+                'capture_method'            => 'manual',
+                'description'               => "Security hold {$booking->reference}",
+                'metadata'                  => [
+                    'booking_id'  => (string) $booking->id,
+                    'booking_ref' => $booking->reference,
+                    'type'        => 'deposit_hold',
+                ],
+            ],
+            ['idempotency_key' => 'hold_hosted_'.$booking->id.'_'.$amount]
+        );
+
+        Log::info('[portal/hold] hosted PI ready', [
+            'booking' => $booking->id,
+            'pi'      => $pi->id,
+            'amount'  => $amount,
+            'ref'     => $booking->reference,
+        ]);
+
+        return view('portal.hold', [
+            'booking'        => $booking,
+            'clientSecret'   => $pi->client_secret,
+            'publishableKey' => config('services.stripe.publishable_key'),
+        ]);
+    }
+
+    /** Manage card flow (Stripe SetupIntent). */
+    protected function runManageFlow(Booking $booking, StripeService $stripe)
+    {
+        $booking->loadMissing('customer');
+        $customer = $booking->customer;
+
+        $stripeCustomerId = $this->ensureStripeCustomer($customer, $stripe);
+
+        $si = $stripe->stripe->setupIntents->create(
+            [
+                'customer'             => $stripeCustomerId,
+                'payment_method_types' => ['card'],
+                'usage'                => 'off_session',
+                'metadata'             => [
+                    'booking_id' => (string) $booking->id,
+                    'type'       => 'manage_card',
+                ],
+            ],
+            ['idempotency_key' => 'manage_'.$booking->id.'_'.now()->timestamp]
+        );
+
+        Log::info('[portal/manage] setup intent ready', [
+            'booking' => $booking->id,
+            'si'      => $si->id,
+            'ref'     => $booking->reference,
+        ]);
+
+        return view('portal.manage', [
+            'booking'        => $booking,
+            'clientSecret'   => $si->client_secret,
+            'publishableKey' => config('services.stripe.publishable_key'),
+            'currentPm'      => $customer->default_payment_method_id,
+        ]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    /** Prefer guard; fall back to legacy session. Redirect to login if neither present. */
+    protected function requireCustomer(Request $request): Customer
+    {
+        if (Auth::guard('customer')->check()) {
+            /** @var Customer $c */
+            $c = Auth::guard('customer')->user();
+            return $c;
+        }
+
+        $id = (int) $request->session()->get('portal_customer_id', 0);
+        if ($id <= 0) {
+            redirect()->route('portal.login')->send();
+            exit; // satisfy static analyzers
+        }
+
+        /** @var Customer $customer */
+        $customer = Customer::findOrFail($id);
+        return $customer;
+    }
+
+    /** If logged in, enforce booking ownership; otherwise allow public token/ref access */
+    protected function authoriseIfLoggedIn(Request $request, Booking $booking): void
+    {
+        $authedId = null;
+
+        if (Auth::guard('customer')->check()) {
+            $authedId = (int) optional(Auth::guard('customer')->user())->id;
+        } else {
+            $authedId = (int) $request->session()->get('portal_customer_id', 0);
+        }
+
+        if ($authedId > 0 && (int) $booking->customer_id !== $authedId) {
+            abort(403, 'This booking does not belong to your account.');
+        }
+    }
+
+    protected function ensureStripeCustomer(Customer $customer, StripeService $stripe): string
+    {
+        $stripeCustomerId = trim((string)($customer->stripe_customer_id ?? '')) ?: null;
+
+        if (!$stripeCustomerId) {
+            $sc = $stripe->stripe->customers->create([
+                'email'    => $customer->email,
+                'name'     => trim(($customer->first_name ?? '').' '.($customer->last_name ?? '')) ?: null,
+                'metadata' => ['customer_id' => (string)$customer->id],
+            ]);
+            $stripeCustomerId = $sc->id;
+            $customer->update(['stripe_customer_id' => $stripeCustomerId]);
+        }
+
+        return $stripeCustomerId;
+    }
+
+    /**
+     * Create/update a local Customer from a VEVS reservation payload.
+     * Adjust field mapping to your VEVS schema as needed.
+     *
+     * @param array<string,mixed> $row
+     */
+    protected function syncOrCreateCustomer(array $row): ?Customer
+    {
+        $email = strtolower(trim((string)($row['customer']['email'] ?? $row['email'] ?? '')));
+        $first = trim((string)($row['customer']['first_name'] ?? $row['first_name'] ?? ''));
+        $last  = trim((string)($row['customer']['last_name'] ?? $row['last_name'] ?? ''));
+
+        if ($email === '' && $first === '' && $last === '') {
+            return null;
+        }
+
+        /** @var Customer $customer */
+        $customer = Customer::updateOrCreate(
+            ['email' => $email ?: null],
+            [
+                'first_name' => $first,
+                'last_name'  => $last,
+                'phone'      => (string)($row['customer']['phone'] ?? $row['phone'] ?? ''),
+                'meta'       => $row['customer'] ?? [],
+            ]
+        );
+
+        return $customer;
+    }
+
+    protected function safeCarbon(?string $value): ?string
+    {
+        if (!$value) return null;
+        try {
+            return Carbon::parse($value)->toDateTimeString();
+        } catch (Throwable $e) {
+            return null;
+        }
+    }
+}

@@ -1,0 +1,148 @@
+<?php
+
+namespace App\Filament\Resources\CustomerResource\Pages;
+
+use App\Filament\Resources\CustomerResource;
+use App\Mail\CustomerPortalLinkMail;
+use App\Models\Customer;
+use Filament\Actions;
+use Filament\Forms;
+use Filament\Notifications\Notification;
+use Filament\Resources\Pages\ViewRecord;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Str;
+
+class ViewCustomer extends ViewRecord
+{
+    protected static string $resource = CustomerResource::class;
+
+    protected function getHeaderActions(): array
+    {
+        return [
+            Actions\EditAction::make(),
+
+            // --- Token-based link (works for /p/dash/{token} and /p/pay/{token})
+            Actions\Action::make('sendPortalLink')
+                ->label('Portal Link')
+                ->icon('heroicon-m-paper-airplane')
+                ->color('primary')
+                ->modalHeading('Send customer portal link')
+                ->form([
+                    Forms\Components\Radio::make('link_type')
+                        ->label('Link type')
+                        ->options([
+                            'dashboard' => 'Customer Dashboard',
+                            'pay'       => 'Pay Deposit / Balance',
+                        ])
+                        ->inline()
+                        ->default('dashboard')
+                        ->required(),
+
+                    Forms\Components\TextInput::make('email')
+                        ->label('Send to')
+                        ->email()
+                        ->required()
+                        ->default(fn (self $page) => (string)($page->record->email ?? '')),
+
+                    Forms\Components\Textarea::make('note')
+                        ->label('Optional message')
+                        ->rows(2)
+                        ->maxLength(500)
+                        ->placeholder('We’ve set up your customer portal link…'),
+                ])
+                ->action(function (array $data, Customer $record): void {
+                    // Ensure a long-lived portal token exists
+                    if (method_exists($record, 'ensurePortalToken')) {
+                        $token = $record->ensurePortalToken();
+                    } else {
+                        if (blank($record->portal_token)) {
+                            $record->portal_token = Str::random(40);
+                            $record->save();
+                        }
+                        $token = $record->portal_token;
+                    }
+
+                    $link = $data['link_type'] === 'pay'
+                        ? route('portal.pay', ['token' => $token])        // GET /p/pay/{token}
+                        : route('portal.dashboard', ['token' => $token]);  // GET /p/dash/{token}
+
+                    // Email the link
+                    if (!empty($data['email'])) {
+                        Mail::to($data['email'])->send(
+                            new CustomerPortalLinkMail($record, $link, (string)($data['note'] ?? ''))
+                        );
+                    }
+
+                    // Show link for quick copy
+                    Notification::make()
+                        ->title('Portal link ready')
+                        ->body($link)
+                        ->success()
+                        ->send();
+                }),
+
+            // --- Magic login link (session-based, via /portal/login/consume)
+            Actions\Action::make('sendMagicLogin')
+                ->label('Magic Login Link')
+                ->icon('heroicon-m-link')
+                ->color('gray')
+                ->modalHeading('Send magic login link')
+                ->form([
+                    Forms\Components\TextInput::make('email')
+                        ->label('Send to')
+                        ->email()
+                        ->required()
+                        ->default(fn (self $page) => (string)($page->record->email ?? '')),
+                    Forms\Components\Textarea::make('note')
+                        ->label('Optional message')
+                        ->rows(2)
+                        ->maxLength(500)
+                        ->placeholder('Use this one-time sign-in link to access your portal.'),
+                ])
+                ->action(function (array $data, Customer $record): void {
+                    // Prefer model helper to build the link; otherwise issue token and build manually
+                    if (method_exists($record, 'buildMagicLoginUrl')) {
+                        $link = $record->buildMagicLoginUrl('portal.magic.consume');
+                    } else {
+                        // Fallback path: generate a one-time token if helper exists
+                        if (method_exists($record, 'issueLoginToken')) {
+                            $raw = $record->issueLoginToken(); // sets hash + expiry internally
+                            $link = route('portal.magic.consume', [
+                                'token' => $raw,
+                                'email' => $record->email,
+                            ]);
+                        } else {
+                            // Absolute fallback: point to request form (not ideal but safe)
+                            $link = route('portal.magic.show');
+                        }
+                    }
+
+                    if (!empty($data['email'])) {
+                        Mail::to($data['email'])->send(
+                            new CustomerPortalLinkMail($record, $link, (string)($data['note'] ?? ''))
+                        );
+                    }
+
+                    Notification::make()
+                        ->title('Magic login link sent')
+                        ->body($link)
+                        ->success()
+                        ->send();
+                }),
+
+            // --- Quick open (token-based dashboard)
+            Actions\Action::make('openPortal')
+                ->label('Open Portal')
+                ->icon('heroicon-m-arrow-top-right-on-square')
+                ->color('gray')
+                ->url(function (Customer $record) {
+                    $token = $record->portal_token;
+                    if (blank($token) && method_exists($record, 'ensurePortalToken')) {
+                        $token = $record->ensurePortalToken();
+                    }
+                    return $token ? route('portal.dashboard', ['token' => $token]) : null;
+                }, shouldOpenInNewTab: true)
+                ->disabled(fn (Customer $record): bool => blank($record->portal_token) && !method_exists($record, 'ensurePortalToken')),
+        ];
+    }
+}
