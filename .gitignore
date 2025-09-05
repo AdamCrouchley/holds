@@ -39,3 +39,5 @@ Homestead.json
 .env
 .env.*
 .env.testing
+.DS_Store
+.env

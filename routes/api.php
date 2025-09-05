@@ -2,66 +2,173 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\Api\TriggerController;
 
 
 /*
 |--------------------------------------------------------------------------
 | API Routes
 |--------------------------------------------------------------------------
-| These routes are automatically prefixed with /api and use the "api" middleware
-| group. CSRF does not apply here, which is ideal for third-party webhooks.
+| Stateless JSON endpoints using the "api" middleware group.
+| Version under /v1. Webhooks can live here (no CSRF).
 |--------------------------------------------------------------------------
 */
 
-/* --------------------------------------------------------------------------
-| Controllers
-|--------------------------------------------------------------------------*/
-use App\Http\Controllers\WebhookController;
+Route::prefix('v1')->group(function () {
+    Route::get('/ping', fn () => response()->json([
+        'ok' => true,
+        'path' => '/api/v1/ping',
+        'ts' => now()->toIso8601String(),
+    ]))->name('api.v1.ping');
+});
+
+Route::prefix('v1')->group(function () {
+    Route::get('/ping', fn () => response()->json(['ok' => true]))->name('api.v1.ping');
+});
 
 /*
 |--------------------------------------------------------------------------
-| Health & Diagnostics
+| CORS preflight convenience
 |--------------------------------------------------------------------------
 */
-Route::get('/_up', fn () => response()->json(['ok' => true, 'ts' => now()->toIso8601String()]));
-Route::get('/ping', fn () => response()->json(['pong' => true]));
+Route::options('/{any}', fn () => response()->noContent())
+    ->where('any', '.*');
 
 /*
 |--------------------------------------------------------------------------
-| Webhooks (public, CSRF-free)
-|  - Stripe:    /api/webhooks/stripe (primary) and /api/stripe/webhook (alias)
-|  - VEVS:      /api/webhooks/vevs
-|--------------------------------------------------------------------------
-| Implement handlers in App\Http\Controllers\WebhookController:
-|   - handle(Request $request)   // Stripe webhook
-|   - vevs(Request $request)     // VEVS webhook
+| v1 Public + Authenticated
 |--------------------------------------------------------------------------
 */
-Route::post('/webhooks/stripe', [WebhookController::class, 'handle'])->name('api.webhooks.stripe');
-Route::post('/stripe/webhook',  [WebhookController::class, 'handle'])->name('api.stripe.webhook'); // alias
-
-Route::post('/webhooks/vevs',   [WebhookController::class, 'vevs'])->name('api.webhooks.vevs');
-
-/*
-|--------------------------------------------------------------------------
-| (Optional) Authenticated API endpoints
-|--------------------------------------------------------------------------
-| If you later need protected JSON endpoints (e.g., to query bookings),
-| you can place them under the Sanctum middleware like this:
-|
-| Route::middleware('auth:sanctum')->group(function () {
-|     Route::get('/me', function (Request $request) {
-|         return $request->user();
-|     });
-| });
-|
-*/
-
-
-
 Route::prefix('v1')
-    ->middleware(['client.throttle:180,60']) // 180 requests per 60 seconds per API key
+    ->middleware(['throttle:api'])
     ->group(function () {
-        Route::post('/triggers/payment-request', [TriggerController::class, 'paymentRequest']);
+        /*
+        |----------------------------------------------------------------------
+        | Health
+        |----------------------------------------------------------------------
+        */
+        Route::get('/health', function () {
+            return response()->json([
+                'ok'      => true,
+                'service' => config('app.name'),
+                'env'     => config('app.env'),
+                'version' => 'v1',
+                'time'    => now()->toIso8601String(),
+            ]);
+        })->name('api.v1.health');
+
+        /*
+        |----------------------------------------------------------------------
+        | Triggers / one-off actions
+        | Example: POST /api/v1/triggers/payment-request
+        |----------------------------------------------------------------------
+        */
+        if (class_exists(\App\Http\Controllers\Api\TriggerController::class)) {
+            Route::post('/triggers/payment-request', [\App\Http\Controllers\Api\TriggerController::class, 'paymentRequest'])
+                ->name('api.v1.triggers.payment-request');
+        }
+
+        /*
+        |----------------------------------------------------------------------
+        | Holds API
+        | Controller: App\Http\Controllers\Holds\Api\V1\HoldsApiController
+        |----------------------------------------------------------------------
+        */
+        if (class_exists(\App\Http\Controllers\Holds\Api\V1\HoldsApiController::class)) {
+            $holds = \App\Http\Controllers\Holds\Api\V1\HoldsApiController::class;
+
+            Route::prefix('holds')->group(function () use ($holds) {
+                // Create/place a hold
+                Route::post('/', [$holds, 'store'])->name('api.v1.holds.store');
+
+                // Get a hold by reference/id
+                Route::get('/{reference}', [$holds, 'show'])
+                    ->where('reference', '[A-Za-z0-9\-_]+')
+                    ->name('api.v1.holds.show');
+
+                // Check status (trimmed payload)
+                Route::get('/{reference}/status', [$holds, 'status'])
+                    ->where('reference', '[A-Za-z0-9\-_]+')
+                    ->name('api.v1.holds.status');
+
+                // Capture funds (full or partial)
+                Route::post('/{reference}/capture', [$holds, 'capture'])
+                    ->where('reference', '[A-Za-z0-9\-_]+')
+                    ->name('api.v1.holds.capture');
+
+                // Cancel/release a hold
+                Route::post('/{reference}/cancel', [$holds, 'cancel'])
+                    ->where('reference', '[A-Za-z0-9\-_]+')
+                    ->name('api.v1.holds.cancel');
+            });
+        }
+
+        /*
+        |----------------------------------------------------------------------
+        | Payments (optional, guarded by class_exists)
+        | Controller: App\Http\Controllers\Api\V1\PaymentsController
+        |----------------------------------------------------------------------
+        */
+        if (class_exists(\App\Http\Controllers\Api\V1\PaymentsController::class)) {
+            $payments = \App\Http\Controllers\Api\V1\PaymentsController::class;
+
+            Route::prefix('payments')->group(function () use ($payments) {
+                Route::post('/intents', [$payments, 'createIntent'])
+                    ->name('api.v1.payments.intents.create');
+
+                Route::post('/intents/{id}/confirm', [$payments, 'confirmIntent'])
+                    ->where('id', '[A-Za-z0-9\-_]+')
+                    ->name('api.v1.payments.intents.confirm');
+
+                Route::post('/charges', [$payments, 'charge'])
+                    ->name('api.v1.payments.charge');
+            });
+        }
+
+        /*
+        |----------------------------------------------------------------------
+        | API Keys (optional verification endpoint)
+        | Controller: App\Http\Controllers\Api\V1\ApiKeyController
+        |----------------------------------------------------------------------
+        */
+        if (class_exists(\App\Http\Controllers\Api\V1\ApiKeyController::class)) {
+            $keys = \App\Http\Controllers\Api\V1\ApiKeyController::class;
+
+            Route::get('/keys/verify', [$keys, 'verify'])
+                ->name('api.v1.keys.verify');
+        }
+
+        /*
+        |----------------------------------------------------------------------
+        | Authenticated (Sanctum/token guard)
+        |----------------------------------------------------------------------
+        */
+        Route::middleware('auth:sanctum')->group(function () {
+            Route::get('/me', function (Request $request) {
+                return $request->user();
+            })->name('api.v1.me');
+        });
     });
+
+/*
+|--------------------------------------------------------------------------
+| Webhooks (Stripe, etc.)
+| Keep outside throttle if desired. Ensure VerifyCsrfToken excludes this path.
+|--------------------------------------------------------------------------
+*/
+if (class_exists(\App\Http\Controllers\WebhookController::class)) {
+    Route::post('/webhooks/stripe', [\App\Http\Controllers\WebhookController::class, 'stripe'])
+        ->name('webhooks.stripe');
+}
+
+/*
+|--------------------------------------------------------------------------
+| Fallback (JSON 404)
+|--------------------------------------------------------------------------
+*/
+Route::fallback(function () {
+    return response()->json([
+        'ok'      => false,
+        'error'   => 'Not Found',
+        'message' => 'Route not found. Check path/method and API version.',
+    ], 404);
+});

@@ -1,4 +1,5 @@
-// app/Http/Controllers/PaymentMethodController.php
+<?php
+
 namespace App\Http\Controllers;
 
 use App\Models\Customer;
