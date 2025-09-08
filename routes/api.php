@@ -3,26 +3,34 @@
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
-
 /*
 |--------------------------------------------------------------------------
 | API Routes
 |--------------------------------------------------------------------------
 | Stateless JSON endpoints using the "api" middleware group.
-| Version under /v1. Webhooks can live here (no CSRF).
+| Versioned under /api/v1. Webhooks can live here (no CSRF).
 |--------------------------------------------------------------------------
 */
 
-Route::prefix('v1')->group(function () {
-    Route::get('/ping', fn () => response()->json([
-        'ok' => true,
-        'path' => '/api/v1/ping',
-        'ts' => now()->toIso8601String(),
-    ]))->name('api.v1.ping');
-});
+/**
+ * NOTE: This file contains a few closure routes (ping/health/options/fallback).
+ * If you intend to use `php artisan route:cache`, move these to controller actions.
+ */
 
+/*
+|--------------------------------------------------------------------------
+| v1: Basic utilities
+|--------------------------------------------------------------------------
+*/
 Route::prefix('v1')->group(function () {
-    Route::get('/ping', fn () => response()->json(['ok' => true]))->name('api.v1.ping');
+    // Simple ping with timestamp & path
+    Route::get('/ping', function () {
+        return response()->json([
+            'ok'   => true,
+            'path' => '/api/v1/ping',
+            'ts'   => now()->toIso8601String(),
+        ]);
+    })->name('api.v1.ping');
 });
 
 /*
@@ -156,8 +164,9 @@ Route::prefix('v1')
 |--------------------------------------------------------------------------
 */
 if (class_exists(\App\Http\Controllers\WebhookController::class)) {
-    Route::post('/webhooks/stripe', [\App\Http\Controllers\WebhookController::class, 'stripe'])
-        ->name('webhooks.stripe');
+    // Full URL: POST /api/webhooks/stripe
+    Route::post('/webhooks/stripe', [\App\Http\Controllers\WebhookController::class, 'handle'])
+        ->name('webhooks.stripe.api');
 }
 
 /*

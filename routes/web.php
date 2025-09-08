@@ -14,11 +14,10 @@ use App\Http\Controllers\VevsWebhookController;
 use App\Http\Controllers\CustomerPortalController;
 use App\Http\Controllers\CustomerAuthController;
 use App\Http\Controllers\PaymentMethodController;
-// use App\Http\Controllers\SupportController; // wrapped with class_exists below
 use App\Http\Controllers\PortalAuthController;
 use App\Http\Middleware\VerifyCsrfToken;
 
-// API v1 Triggers
+// API v1 Triggers (web-exposed)
 use App\Http\Controllers\Api\TriggerController;
 
 // Portal Pay (job payment links)
@@ -42,12 +41,12 @@ Route::get('/', fn () => view('welcome'))->name('home');
 | Global route parameter patterns
 |--------------------------------------------------------------------------
 */
-Route::pattern('token',    '[A-Za-z0-9_-]{16,64}');
+Route::pattern('token',    '[A-Za-z0-9\-_]{16,64}');
 Route::pattern('booking',  '[0-9]+');
 Route::pattern('deposit',  '[0-9]+');
 Route::pattern('customer', '[0-9]+');
 Route::pattern('payment',  '[0-9]+');
-Route::pattern('job',      '[0-9]+'); // for signed job pay route
+Route::pattern('job',      '[0-9]+');
 
 /*
 |--------------------------------------------------------------------------
@@ -93,6 +92,7 @@ Route::get('/p/pay/{booking}/complete', [PaymentController::class, 'portalComple
 Route::post('/p/hold/{booking}/intent',  [PaymentController::class, 'portalCreateHoldIntent'])
     ->whereNumber('booking')
     ->name('portal.hold.intent');
+
 Route::get('/p/hold/{booking}/complete', [PaymentController::class, 'portalCompleteHold'])
     ->whereNumber('booking')
     ->name('portal.hold.complete');
@@ -117,12 +117,9 @@ Route::get('/p/t', [PortalController::class, 'magicLink'])->name('portal.magic')
 | Tokenized hosted payment pages (/p/pay/{token})
 |--------------------------------------------------------------------------
 */
-Route::get('/p/pay/{token}',          [PaymentController::class, 'showPortalPay'])
-    ->name('portal.pay.token');
-Route::post('/p/pay/{token}/intent',  [PaymentController::class, 'createOrReuseBalanceIntent'])
-    ->name('portal.pay.intent.token');
-Route::post('/p/pay/{token}/confirm', [PaymentController::class, 'markPaid'])
-    ->name('portal.pay.confirm');
+Route::get('/p/pay/{token}',          [PaymentController::class, 'showPortalPay'])->name('portal.pay.token');
+Route::post('/p/pay/{token}/intent',  [PaymentController::class, 'createOrReuseBalanceIntent'])->name('portal.pay.intent.token');
+Route::post('/p/pay/{token}/confirm', [PaymentController::class, 'markPaid'])->name('portal.pay.confirm');
 
 /*
 |--------------------------------------------------------------------------
@@ -204,9 +201,12 @@ Route::get('/customer/dashboard', fn () => view('customer.dashboard'))
 |--------------------------------------------------------------------------
 */
 Route::post('/bookings/{booking}/deposit', [PaymentController::class, 'deposit'])
-    ->whereNumber('booking')->name('booking.deposit');
+    ->whereNumber('booking')
+    ->name('booking.deposit');
+
 Route::post('/bookings/{booking}/balance', [PaymentController::class, 'balance'])
-    ->whereNumber('booking')->name('booking.balance');
+    ->whereNumber('booking')
+    ->name('booking.balance');
 
 /*
 |--------------------------------------------------------------------------
@@ -214,11 +214,16 @@ Route::post('/bookings/{booking}/balance', [PaymentController::class, 'balance']
 |--------------------------------------------------------------------------
 */
 Route::post('/bookings/{booking}/hold',    [DepositController::class, 'authorise'])
-    ->whereNumber('booking')->name('booking.hold');
+    ->whereNumber('booking')
+    ->name('booking.hold');
+
 Route::post('/deposits/{deposit}/capture', [DepositController::class, 'capture'])
-    ->whereNumber('deposit')->name('deposit.capture');
+    ->whereNumber('deposit')
+    ->name('deposit.capture');
+
 Route::post('/deposits/{deposit}/void',    [DepositController::class, 'void'])
-    ->whereNumber('deposit')->name('deposit.void');
+    ->whereNumber('deposit')
+    ->name('deposit.void');
 
 /*
 |--------------------------------------------------------------------------
@@ -229,9 +234,11 @@ Route::middleware(['auth'])->group(function () {
     Route::post('/admin/bookings/{booking}/post-charge', [PaymentController::class, 'postHireCharge'])
         ->whereNumber('booking')
         ->name('admin.bookings.post_charge');
+
     Route::post('/admin/hold/{payment}/capture', [PaymentController::class, 'captureHold'])
         ->whereNumber('payment')
         ->name('admin.hold.capture');
+
     Route::post('/admin/hold/{payment}/release', [PaymentController::class, 'releaseHold'])
         ->whereNumber('payment')
         ->name('admin.hold.release');
@@ -265,42 +272,31 @@ Route::middleware(['auth'])->group(function () {
     })->middleware('throttle:3,1')->name('admin.integrations.dreamdrives.sync');
 });
 
-
 /*
 |--------------------------------------------------------------------------
 | Alias: /portal/pay/job/{job}
 |--------------------------------------------------------------------------
 */
 Route::get('/portal/pay/job/{job}', [PayController::class, 'show'])
-    ->name('portal.pay.job')
-    ->middleware('signed');
-
-
+    ->middleware('signed')
+    ->name('portal.pay.job');
 
 /*
 |--------------------------------------------------------------------------
-| Sync by reference (PATCHED)
+| Sync by reference (single route; optional path param)
 |--------------------------------------------------------------------------
+|
+| Supports either:
+|  - POST /sync/by-reference            with JSON body { reference: "..." }
+|  - POST /sync/by-reference/ABC123     with path param
+|
 */
-// POST body should include 'reference' (and optional 'job_id')
-Route::post('/sync/by-reference', [\App\Http\Controllers\SyncController::class, 'byReference'])
+Route::post('/sync/by-reference/{reference?}', [\App\Http\Controllers\SyncController::class, 'byReference'])
     ->name('sync.byReference');
 
-
 /*
 |--------------------------------------------------------------------------
-| Sync by reference (PATCHED)
-|--------------------------------------------------------------------------
-*/
-// POST body will contain 'reference' (and optional 'job_id')
-Route::post('/sync/by-reference/{reference}', [\App\Http\Controllers\SyncController::class, 'byReference'])
-    ->name('sync.byReference');
-
-
-
-/*
-|--------------------------------------------------------------------------
-| Public API v1
+| Public API v1 (web-exposed)
 |--------------------------------------------------------------------------
 */
 Route::prefix('v1')
@@ -313,18 +309,16 @@ Route::prefix('v1')
 
 /*
 |--------------------------------------------------------------------------
-| Webhooks
+| Webhooks (web side)
 |--------------------------------------------------------------------------
 */
 Route::post('/webhooks/stripe', [WebhookController::class, 'handle'])
-    ->name('webhooks.stripe')
-    ->withoutMiddleware([VerifyCsrfToken::class]);
-Route::post('/stripe/webhook', [WebhookController::class, 'handle'])
-    ->name('stripe.webhook')
-    ->withoutMiddleware([VerifyCsrfToken::class]);
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('webhooks.stripe.web');
+
 Route::post('/webhooks/vevs', [VevsWebhookController::class, 'handle'])
-    ->name('webhooks.vevs')
-    ->withoutMiddleware([VerifyCsrfToken::class]);
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('webhooks.vevs');
 
 /*
 |--------------------------------------------------------------------------
@@ -376,8 +370,9 @@ Route::fallback(function () {
 |--------------------------------------------------------------------------
 */
 Route::get('p/job/{job}/pay', [PayController::class, 'show'])
-    ->name('portal.job.pay')
-    ->middleware('signed');
+    ->middleware('signed')
+    ->name('portal.job.pay');
+
 Route::get('p/pay/t/{token}', [PayController::class, 'showByToken'])
     ->name('portal.job.pay.token');
 
