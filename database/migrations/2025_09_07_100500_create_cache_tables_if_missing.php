@@ -9,7 +9,7 @@ return new class extends Migration {
     {
         if (! Schema::hasTable('cache')) {
             Schema::create('cache', function (Blueprint $table) {
-                $table->string('key')->primary();
+                $table->string('key', 191)->primary();   // ← 191
                 $table->mediumText('value');
                 $table->integer('expiration');
             });
@@ -17,8 +17,8 @@ return new class extends Migration {
 
         if (! Schema::hasTable('cache_locks')) {
             Schema::create('cache_locks', function (Blueprint $table) {
-                $table->string('key')->primary();
-                $table->string('owner');
+                $table->string('key', 191)->primary();   // ← 191
+                $table->string('owner')->nullable();
                 $table->integer('expiration');
             });
         }
@@ -26,8 +26,8 @@ return new class extends Migration {
 
     public function down(): void
     {
-        // Safe default: keep infra tables.
-        // Schema::dropIfExists('cache_locks');
-        // Schema::dropIfExists('cache');
+        Schema::dropIfExists('cache_locks');
+        Schema::dropIfExists('cache');
     }
 };
+
