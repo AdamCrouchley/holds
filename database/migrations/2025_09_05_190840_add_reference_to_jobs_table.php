@@ -30,9 +30,7 @@ return new class extends Migration {
 
             Schema::table('payments', function (Blueprint $table) {
                 // Drop the old FK/column if possible, then rename the shadow column
-                if (Schema::hasColumn('payments', 'booking_id')) {
-                    $table->dropColumn('booking_id');
-                }
+
             });
 
             Schema::table('payments', function (Blueprint $table) {

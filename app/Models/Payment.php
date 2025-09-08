@@ -2,8 +2,6 @@
 
 namespace App\Models;
 
-use App\Models\Booking;
-use App\Models\Job;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -21,17 +19,20 @@ class Payment extends Model
         'job_id',
         'customer_id',
 
+        // Linking reference (booking/job reference string)
+        'reference',
+
         // Money (stored as cents)
-        'amount_cents',               // integer cents
-        'currency',                   // e.g., NZD
+        'amount_cents',   // integer cents
+        'currency',       // e.g., NZD
 
         // Status
-        'status',                     // pending | succeeded | failed | canceled
+        'status',         // pending | succeeded | failed | canceled
 
         // Classification
-        'type',                       // booking_deposit | booking_balance | post_hire | bond_hold | bond_capture | refund, etc.
-        'purpose',                    // optional free-form reason/purpose
-        'mechanism',                  // card | bank_transfer | cash | etc.
+        'type',           // booking_deposit | booking_balance | post_hire | bond_hold | bond_capture | refund, etc.
+        'purpose',        // optional free-form reason/purpose
+        'mechanism',      // card | bank_transfer | cash | etc.
 
         // PSP / Stripe references
         'stripe_payment_intent_id',
@@ -39,12 +40,11 @@ class Payment extends Model
         'stripe_charge_id',
 
         // Extra details
-        'details',                    // json
-        'reference',                  // booking or job reference (needed for auto-linking)
+        'details',        // json
     ];
 
     /**
-     * Casts.
+     * Attribute casting.
      */
     protected $casts = [
         'amount_cents' => 'integer',
@@ -52,17 +52,17 @@ class Payment extends Model
     ];
 
     /**
-     * Booted hooks.
+     * Model boot hooks.
      */
     protected static function booted(): void
     {
         static::saving(function (Payment $payment) {
-            // If booking not chosen but we have a reference, try to link automatically.
+            // If booking not chosen but we have a reference, try to auto-link.
             if (! $payment->booking_id && $payment->reference) {
                 $bookingId = Booking::where('reference', $payment->reference)->value('id');
 
                 if (! $bookingId) {
-                    // Fallback: find a Job with same reference and use its booking
+                    // Fallback: find a Job with the same reference and use its booking_id
                     $bookingId = Job::where('reference', $payment->reference)->value('booking_id');
                 }
 
