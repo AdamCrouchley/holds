@@ -2,45 +2,33 @@
 
 declare(strict_types=1);
 
-use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Database\Schema\Blueprint;
 
-return new class extends Migration {
-    public function up(): void
-    {
-        $driver = Schema::getConnection()->getDriverName();
+public function up(): void
+{
+    // … whatever else you already do …
 
-        if (in_array($driver, ['mysql', 'pgsql'])) {
-            Schema::table('payments', function (Blueprint $table) {
-                $table->foreignId('booking_id')->nullable()->change();
-            });
-        } else {
-            // SQLite can't "change()" nullability. Quick, safe workaround:
-            Schema::table('payments', function (Blueprint $table) {
-                if (! Schema::hasColumn('payments', 'booking_id')) return;
-                // Add a shadow column that IS nullable
-                if (! Schema::hasColumn('payments', 'booking_id_nullable')) {
-                    $table->unsignedBigInteger('booking_id_nullable')->nullable()->after('id');
-                }
-            });
-
-            // Copy data across
-            \DB::statement('UPDATE payments SET booking_id_nullable = booking_id');
-
-            Schema::table('payments', function (Blueprint $table) {
-                // Drop the old FK/column if possible, then rename the shadow column
-
-            });
-
-            Schema::table('payments', function (Blueprint $table) {
-                $table->renameColumn('booking_id_nullable', 'booking_id');
-            });
+    Schema::table('payments', function (Blueprint $table) {
+        // On SQLite, avoid rename/drop patterns that cause duplicate-name issues
+        if (DB::getDriverName() === 'sqlite') {
+            // Ensure the column exists; if it already does, don't touch it
+            if (! Schema::hasColumn('payments', 'booking_id')) {
+                $table->unsignedBigInteger('booking_id')->nullable()->index()->after('job_id');
+            }
+            // DO NOT attempt rename/drop on SQLite
+            return;
         }
-    }
 
-    public function down(): void
-    {
-        // Reverting to NOT NULL is risky if rows are null; skip for safety.
-    }
-};
+        // MySQL/MariaDB path (safe to leave if you really need it):
+        if (! Schema::hasColumn('payments', 'booking_id')) {
+            $table->unsignedBigInteger('booking_id')->nullable()->index()->after('job_id');
+        }
+        // If you previously created booking_id_nullable and want to rename on MySQL only:
+        // if (Schema::hasColumn('payments', 'booking_id_nullable') && ! Schema::hasColumn('payments', 'booking_id')) {
+        //     $table->renameColumn('booking_id_nullable', 'booking_id');
+        // }
+    });
+}
+
