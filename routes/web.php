@@ -3,9 +3,11 @@
 use Illuminate\Support\Facades\Route;
 use Illuminate\Http\Request;
 
-/* --------------------------------------------------------------------------
+/*
+|--------------------------------------------------------------------------
 | Controllers
-|--------------------------------------------------------------------------*/
+|--------------------------------------------------------------------------
+*/
 use App\Http\Controllers\PortalController;
 use App\Http\Controllers\PaymentController;
 use App\Http\Controllers\DepositController;
@@ -20,12 +22,10 @@ use App\Http\Middleware\VerifyCsrfToken;
 // API v1 Triggers (web-exposed)
 use App\Http\Controllers\Api\TriggerController;
 
-// Portal Pay (job payment links)
+// Portal Pay (job/booking payment links)
 use App\Http\Controllers\Portal\PayController;
 
-/* --------------------------------------------------------------------------
-| Jobs (DreamDrives)
-|--------------------------------------------------------------------------*/
+// Admin jobs
 use App\Jobs\SyncDreamDrivesWeekMade;
 use App\Jobs\SyncDreamDrivesWeekPickup;
 
@@ -47,6 +47,33 @@ Route::pattern('deposit',  '[0-9]+');
 Route::pattern('customer', '[0-9]+');
 Route::pattern('payment',  '[0-9]+');
 Route::pattern('job',      '[0-9]+');
+
+/*
+|--------------------------------------------------------------------------
+| Portal Pay (used by pay.blade)
+|--------------------------------------------------------------------------
+| GET display + POST endpoints consumed by fetch() in the Blade.
+| Supports both {job} and {booking} paths.
+*/
+Route::middleware('web')->group(function () {
+    // Show page (GET)
+    Route::get('/p/job/{job}/pay', [PayController::class, 'show'])
+        ->middleware('signed') // keep if you generate signed URLs
+        ->name('portal.pay.show.job');
+
+    Route::get('/p/booking/{booking}/pay', [PayController::class, 'showBooking'])
+        ->name('portal.pay.show.booking'); // optional if you support bookings
+
+    // Create payment/hold intents (POST)
+    Route::post('/p/intent/{type}/{id}', [PayController::class, 'intent'])
+        ->whereIn('type', ['job', 'booking'])
+        ->name('portal.intent.store');
+
+    // Notify server that a hold PI succeeded (POST)
+    Route::post('/p/pay/{type}/{id}/hold-recorded', [PayController::class, 'holdRecorded'])
+        ->whereIn('type', ['job', 'booking'])
+        ->name('portal.pay.hold-recorded.store');
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -178,7 +205,7 @@ Route::prefix('portal')->group(function () {
 | Legacy username/password Customer Auth
 |--------------------------------------------------------------------------
 */
-Route::middleware(['web'])->group(function () {
+Route::middleware('web')->group(function () {
     Route::post('/customer/login',  [CustomerAuthController::class, 'login'])->name('customer.login.attempt');
     Route::post('/customer/logout', [CustomerAuthController::class, 'logout'])->name('customer.logout');
     Route::get('/customer/bookings', [CustomerAuthController::class, 'bookings'])
@@ -274,22 +301,19 @@ Route::middleware(['auth'])->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Alias: /portal/pay/job/{job}
+| Alias: /portal/pay/job/{job} (redirect to canonical)
 |--------------------------------------------------------------------------
 */
-Route::get('/portal/pay/job/{job}', [PayController::class, 'show'])
+Route::get('/portal/pay/job/{job}', fn (int $job) => redirect()->route('portal.pay.show.job', ['job' => $job]))
     ->middleware('signed')
     ->name('portal.pay.job');
 
 /*
 |--------------------------------------------------------------------------
-| Sync by reference (single route; optional path param)
+| Sync by reference (optional)
 |--------------------------------------------------------------------------
-|
-| Supports either:
-|  - POST /sync/by-reference            with JSON body { reference: "..." }
-|  - POST /sync/by-reference/ABC123     with path param
-|
+| POST /sync/by-reference            with JSON body { reference: "..." }
+| POST /sync/by-reference/ABC123     with path param
 */
 Route::post('/sync/by-reference/{reference?}', [\App\Http\Controllers\SyncController::class, 'byReference'])
     ->name('sync.byReference');
@@ -357,27 +381,6 @@ Route::get('/_up', fn () => response()->json(['ok' => true]))->name('health');
 
 /*
 |--------------------------------------------------------------------------
-| Fallback 404
-|--------------------------------------------------------------------------
-*/
-Route::fallback(function () {
-    return response()->view('errors.404', [], 404);
-});
-
-/*
-|--------------------------------------------------------------------------
-| Signed & token job payment links
-|--------------------------------------------------------------------------
-*/
-Route::get('p/job/{job}/pay', [PayController::class, 'show'])
-    ->middleware('signed')
-    ->name('portal.job.pay');
-
-Route::get('p/pay/t/{token}', [PayController::class, 'showByToken'])
-    ->name('portal.job.pay.token');
-
-/*
-|--------------------------------------------------------------------------
 | One-off debug: DB check (web vs tinker)
 |--------------------------------------------------------------------------
 */
@@ -388,4 +391,13 @@ Route::get('/_db-check', function () {
         'sqlite_db'  => config('database.connections.sqlite.database'),
         'columns'    => \Schema::getColumnListing('bookings'),
     ]);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Fallback 404
+|--------------------------------------------------------------------------
+*/
+Route::fallback(function () {
+    return response()->view('errors.404', [], 404);
 });
