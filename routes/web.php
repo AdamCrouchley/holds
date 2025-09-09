@@ -67,9 +67,10 @@ Route::get('/mail-test', function () {
 | - GET  /p/job/{job}/pay              -> PayController@show
 | - GET  /p/pay/t/{token}              -> PayController@showByToken
 | - GET  /p/job/{job}/pay/url          -> PayController@url
+| - POST /p/job/{job}/paid             -> PayController@recordPaid      <-- NEW
 | - POST /p/{type}/{id}/intent         -> PayController@intent
 | - POST /p/{type}/{id}/hold-recorded  -> PayController@holdRecorded
-| - POST /p/{type}/{id}/bundle         -> PayController@bundle   <-- NEW
+| - POST /p/{type}/{id}/bundle         -> PayController@bundle
 |
 */
 Route::middleware('web')->group(function () {
@@ -85,6 +86,11 @@ Route::middleware('web')->group(function () {
     Route::get('/p/job/{job}/pay/url', [PayController::class, 'url'])
         ->name('portal.pay.url');
 
+    // NEW: record a paid payment for a Job
+    Route::post('/p/job/{job}/paid', [PayController::class, 'recordPaid'])
+        ->whereNumber('job')
+        ->name('portal.pay.recordPaid');
+
     // Optional stubs used by the front-end
     Route::post('/p/{type}/{id}/intent', [PayController::class, 'intent'])
         ->where('type', 'job|booking')
@@ -96,7 +102,7 @@ Route::middleware('web')->group(function () {
         ->whereNumber('id')
         ->name('portal.pay.hold-recorded');
 
-    // NEW: Bundle endpoint (e.g., to create PI + SI together)
+    // Bundle endpoint (e.g., to create PI + SI together)
     Route::post('/p/{type}/{id}/bundle', [PayController::class, 'bundle'])
         ->where('type', 'job|booking')
         ->whereNumber('id')
