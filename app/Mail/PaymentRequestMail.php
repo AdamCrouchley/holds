@@ -13,20 +13,28 @@ class PaymentRequestMail extends Mailable
 
     public function __construct(
         public Job $job,
-        public string $payUrl,
-        public int $amountCents
+        public string $payUrl,          // signed or token URL
+        public ?int $amountCents = null,// optional specific amount (e.g., deposit)
+        public ?string $purpose = null, // 'deposit' | 'balance' | 'payment'
+        public ?object $brand = null,   // Brand context (logo/url/colors)
     ) {}
 
     public function build()
     {
-        $amount = number_format($this->amountCents / 100, 2);
+        $brand = $this->brand;
+        $subject = sprintf(
+            '%s — Secure payment link for Job #%d',
+            $brand->short_name ?? 'Dream Drives',
+            $this->job->id
+        );
 
-        return $this->subject("Payment request for {$this->job->reference} - \${$amount}")
-            ->markdown('emails.payment_request', [
-                'job'        => $this->job,
-                'payUrl'     => $this->payUrl,
-                'amount'     => $amount,
-                'amountCents'=> $this->amountCents,
+        return $this->subject($subject)
+            ->markdown('mail.payment-request', [
+                'job'         => $this->job,
+                'payUrl'      => $this->payUrl,
+                'amountCents' => $this->amountCents,
+                'purpose'     => $this->purpose,
+                'brand'       => $brand,
             ]);
     }
 }

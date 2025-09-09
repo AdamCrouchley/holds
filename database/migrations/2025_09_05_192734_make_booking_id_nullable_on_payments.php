@@ -9,133 +9,89 @@ return new class extends Migration
 {
     public function up(): void
     {
-        $this->dropPaymentsBookingFkIfExists();
+        // If the table doesn't exist yet, nothing to do.
+        if (! Schema::hasTable('payments')) {
+            return;
+        }
 
-        $driver = DB::getDriverName();
+        // Detect current columns in the live table
+        $cols = collect(Schema::getColumnListing('payments'))->flip();
 
-        if ($driver === 'sqlite') {
-            // make booking_id nullable by rebuilding the table (SQLite limitation)
-            Schema::disableForeignKeyConstraints();
+        // Build expressions to SELECT from the old table into the new one.
+        // For columns that might not exist yet, fall back to NULL or a default and alias them.
+        $idExpr        = 'id';
+        $jobIdExpr     = $cols->has('job_id')   ? 'job_id'   : 'NULL AS job_id';
+        $bookingIdExpr = $cols->has('booking_id') ? 'booking_id' : 'NULL AS booking_id';
+        $referenceExpr = $cols->has('reference') ? 'reference' : 'NULL AS reference';
 
-            // Clean up just in case a previous failed run left this behind
-            try { Schema::drop('payments_tmp'); } catch (\Throwable $e) {}
+        // amount_cents may not exist; some schemas used `amount`.
+        if ($cols->has('amount_cents')) {
+            $amountCentsExpr = 'amount_cents';
+        } elseif ($cols->has('amount')) {
+            $amountCentsExpr = 'amount AS amount_cents';
+        } else {
+            $amountCentsExpr = '0 AS amount_cents';
+        }
 
-            Schema::create('payments_tmp', function (Blueprint $table) {
-                $table->id();
+        $currencyExpr  = $cols->has('currency')  ? 'currency'  : "NULL AS currency";
+        $statusExpr    = $cols->has('status')    ? 'status'    : "NULL AS status";
+        $typeExpr      = $cols->has('type')      ? 'type'      : "NULL AS type";
+        $mechExpr      = $cols->has('mechanism') ? 'mechanism' : "NULL AS mechanism";
 
-                // Keep the columns you actually have:
-                $table->unsignedBigInteger('job_id')->nullable();
-                $table->unsignedBigInteger('booking_id')->nullable(); // <-- now nullable
+        $piExpr        = $cols->has('stripe_payment_intent_id')  ? 'stripe_payment_intent_id'  : 'NULL AS stripe_payment_intent_id';
+        $pmExpr        = $cols->has('stripe_payment_method_id')  ? 'stripe_payment_method_id'  : 'NULL AS stripe_payment_method_id';
+        $chExpr        = $cols->has('stripe_charge_id')          ? 'stripe_charge_id'          : 'NULL AS stripe_charge_id';
 
-                $table->string('reference', 191)->nullable();
+        // details might be TEXT/JSON; preserve if present
+        $detailsExpr   = $cols->has('details') ? 'details' : 'NULL AS details';
 
-                // Money (stored as cents)
-                $table->integer('amount_cents');
-                $table->string('currency', 10)->default('NZD');
+        $createdExpr   = $cols->has('created_at') ? 'created_at' : 'NULL AS created_at';
+        $updatedExpr   = $cols->has('updated_at') ? 'updated_at' : 'NULL AS updated_at';
 
-                // Status & classification (that exist in your table)
-                $table->string('status', 50);
-                $table->string('type', 50)->nullable();
-                $table->string('mechanism', 50)->nullable();
+        DB::transaction(function () use (
+            $idExpr, $jobIdExpr, $bookingIdExpr, $referenceExpr, $amountCentsExpr, $currencyExpr, $statusExpr,
+            $typeExpr, $mechExpr, $piExpr, $pmExpr, $chExpr, $detailsExpr, $createdExpr, $updatedExpr
+        ) {
+            // 1) Create the new temp table with the desired target schema.
+            DB::statement(<<<'SQL'
+                CREATE TABLE payments_tmp (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NULL,
+                    booking_id INTEGER NULL,
+                    reference TEXT NULL,
+                    amount_cents INTEGER NOT NULL DEFAULT 0,
+                    currency TEXT NULL,
+                    status TEXT NULL,
+                    type TEXT NULL,
+                    mechanism TEXT NULL,
+                    stripe_payment_intent_id TEXT NULL,
+                    stripe_payment_method_id TEXT NULL,
+                    stripe_charge_id TEXT NULL,
+                    details TEXT NULL,
+                    created_at TEXT NULL,
+                    updated_at TEXT NULL
+                );
+            SQL);
 
-                // Stripe / PSP fields
-                $table->string('stripe_payment_intent_id', 191)->nullable();
-                $table->string('stripe_payment_method_id', 191)->nullable();
-                $table->string('stripe_charge_id', 191)->nullable();
-
-                // Extras
-                $table->json('details')->nullable();
-
-                $table->timestamps();
-            });
-
-            // Copy ONLY existing columns (no 'purpose')
+            // 2) Copy data from the old table, mapping/aliasing as needed.
             DB::statement("
                 INSERT INTO payments_tmp
                     (id, job_id, booking_id, reference, amount_cents, currency, status, type, mechanism,
                      stripe_payment_intent_id, stripe_payment_method_id, stripe_charge_id, details, created_at, updated_at)
                 SELECT
-                    id, job_id, booking_id, reference, amount_cents, currency, status, type, mechanism,
-                    stripe_payment_intent_id, stripe_payment_method_id, stripe_charge_id, details, created_at, updated_at
+                    {$idExpr}, {$jobIdExpr}, {$bookingIdExpr}, {$referenceExpr}, {$amountCentsExpr}, {$currencyExpr}, {$statusExpr}, {$typeExpr}, {$mechExpr},
+                    {$piExpr}, {$pmExpr}, {$chExpr}, {$detailsExpr}, {$createdExpr}, {$updatedExpr}
                 FROM payments
             ");
 
-            Schema::drop('payments');
-            Schema::rename('payments_tmp', 'payments');
-
-            Schema::enableForeignKeyConstraints();
-        } else {
-            // MySQL/Postgres
-            Schema::table('payments', function (Blueprint $table) {
-                $table->unsignedBigInteger('booking_id')->nullable()->change();
-            });
-        }
+            // 3) Swap: drop old and rename new
+            DB::statement('DROP TABLE payments;');
+            DB::statement('ALTER TABLE payments_tmp RENAME TO payments;');
+        });
     }
 
     public function down(): void
     {
-        $driver = DB::getDriverName();
-
-        if ($driver === 'sqlite') {
-            Schema::disableForeignKeyConstraints();
-
-            try { Schema::drop('payments_tmp'); } catch (\Throwable $e) {}
-
-            Schema::create('payments_tmp', function (Blueprint $table) {
-                $table->id();
-
-                $table->unsignedBigInteger('job_id')->nullable();
-                $table->unsignedBigInteger('booking_id'); // NOT NULL again
-
-                $table->string('reference', 191)->nullable();
-
-                $table->integer('amount_cents');
-                $table->string('currency', 10)->default('NZD');
-
-                $table->string('status', 50);
-                $table->string('type', 50)->nullable();
-                $table->string('mechanism', 50)->nullable();
-
-                $table->string('stripe_payment_intent_id', 191)->nullable();
-                $table->string('stripe_payment_method_id', 191)->nullable();
-                $table->string('stripe_charge_id', 191)->nullable();
-
-                $table->json('details')->nullable();
-
-                $table->timestamps();
-            });
-
-            DB::statement("
-                INSERT INTO payments_tmp
-                    (id, job_id, booking_id, reference, amount_cents, currency, status, type, mechanism,
-                     stripe_payment_intent_id, stripe_payment_method_id, stripe_charge_id, details, created_at, updated_at)
-                SELECT
-                    id, job_id, booking_id, reference, amount_cents, currency, status, type, mechanism,
-                    stripe_payment_intent_id, stripe_payment_method_id, stripe_charge_id, details, created_at, updated_at
-                FROM payments
-            ");
-
-            Schema::drop('payments');
-            Schema::rename('payments_tmp', 'payments');
-
-            Schema::enableForeignKeyConstraints();
-        } else {
-            Schema::table('payments', function (Blueprint $table) {
-                $table->unsignedBigInteger('booking_id')->nullable(false)->change();
-            });
-        }
-
-        // Optionally re-add FK here if you had one originally.
-    }
-
-    private function dropPaymentsBookingFkIfExists(): void
-    {
-        try {
-            Schema::table('payments', function (Blueprint $table) {
-                foreach (['payments_booking_id_foreign', 'payments_booking_foreign'] as $name) {
-                    try { $table->dropForeign($name); } catch (\Throwable $e) {}
-                }
-            });
-        } catch (\Throwable $e) {}
+        // This down() can be a no-op for SQLite rebuilds, or you could rebuild back.
     }
 };

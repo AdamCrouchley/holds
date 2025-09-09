@@ -115,4 +115,22 @@ return [
         'name' => env('MAIL_FROM_NAME', 'Example'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Markdown Mail Settings
+    |--------------------------------------------------------------------------
+    |
+    | If you're using Markdown based email rendering, you may configure your
+    | theme and component paths here. This allows you to customize the look
+    | of the emails.
+    |
+    */
+
+    'markdown' => [
+        'theme' => 'brand', // <= use our theme by default
+        'paths' => [
+            resource_path('views/vendor/mail'),
+        ],
+    ],
+
 ];

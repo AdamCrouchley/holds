@@ -1,189 +1,159 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App\Http\Controllers\Portal;
 
 use App\Http\Controllers\Controller;
 use App\Models\Job;
-use App\Models\JobAccessToken;
-// use App\Models\Booking; // uncomment if you have a Booking model
-use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Arr;
-use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\URL;
 use Stripe\StripeClient;
 use Throwable;
 
 class PayController extends Controller
 {
+    /** Stripe SDK client */
+    protected function stripe(): StripeClient
+    {
+        return new StripeClient(config('services.stripe.secret'));
+    }
+
+    /** Currency priority: Job -> Flow -> NZD */
+    protected function currencyFor(Job $job): string
+    {
+        return strtolower($job->currency ?? optional($job->flow)->currency ?? 'NZD');
+    }
+
+    /** Compute remaining balance (authoritative, server-side) */
+    protected function remainingCents(Job $job): int
+    {
+        $total = (int) ($job->charge_amount ?? 0);
+        $paid  = (int) ($job->paid_amount_cents ?? 0);
+
+        // Fallback to payments() if you have that relation and no cached paid_amount_cents
+        if ($paid === 0 && method_exists($job, 'payments')) {
+            try {
+                $paid = (int) $job->payments()
+                    ->whereIn('status', ['succeeded', 'captured'])
+                    ->sum('amount_cents');
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+
+        return max(0, $total - $paid);
+    }
+
+    /** Flow-driven hold amount in cents (column: hold_amount_cents) */
+    protected function flowHoldCents(Job $job): int
+    {
+        return (int) (optional($job->flow)->hold_amount_cents ?? 0);
+    }
+
     /**
-     * Show the payment page for a Job via standard route-model binding.
-     * Route example: GET /p/job/{job}/pay  (signed recommended)
+     * GET /p/job/{job}/pay
+     * Render the payment page.
+     * If you want to force signed URLs only, uncomment the signature check.
      */
     public function show(Request $request, Job $job)
     {
-        // abort_if($job->status === 'cancelled', 404);
-        // abort_unless($request->hasValidSignature(), 403);
+        // Uncomment if this route is signed and you want to enforce it
+        // if (!$request->hasValidSignature()) abort(401);
 
         return view('portal.pay', ['job' => $job]);
     }
 
     /**
-     * Optional: show the payment page for a Booking if you support bookings.
-     * Route example: GET /p/booking/{booking}/pay
+     * GET shareable signed URL (used by "Copy secure payment link" in the Blade).
      */
-    public function showBooking(Request $request, /* Booking */ $booking)
+    public function url(Job $job)
     {
-        // Replace type if you have a concrete Booking model: public function showBooking(Request $request, Booking $booking)
-        return view('portal.pay', ['booking' => $booking]);
+        $url = URL::signedRoute('portal.pay.show.job', ['job' => $job->id]);
+        return response()->json(['url' => $url]);
     }
 
     /**
-     * Show the payment page for a Job via a shareable token link.
-     * Route example: GET /p/pay/t/{token}
-     */
-    public function showByToken(string $token)
-    {
-        $access = JobAccessToken::with('job')->where('token', $token)->firstOrFail();
-
-        // Optional expiry/revocation check if your model has it
-        abort_unless(method_exists($access, 'isValid') ? $access->isValid() : true, 403);
-
-        return view('portal.pay', [
-            'job'   => $access->job,
-            'token' => $token,
-        ]);
-    }
-
-    /**
-     * Create/Upsert a Stripe PaymentIntent for a Job/Booking.
+     * POST /p/{type}/{id}/bundle
      *
-     * POST /p/intent/{type}/{id}
-     * Body (JSON/Form):
-     * - amount_cents: int (required)
-     * - currency: string (default "NZD")
-     * - mode: "payment" | "hold" (default "payment")
-     * - reference: string (optional) — your internal reference to persist
+     * Create a "bundle" of two PaymentIntents:
+     *  - Charge PI for the remaining balance (automatic capture)
+     *  - Hold  PI for the security deposit (manual capture)
      *
-     * Returns: { payment_intent_id, client_secret, mode }
+     * Both are returned to the client to confirm with the SAME card in one flow.
      */
-    public function intent(Request $request, string $type, int $id): JsonResponse
+    public function bundle(Request $request, string $type, int $id)
     {
-        $validated = $request->validate([
-            'amount_cents' => ['required', 'integer', 'min:1'],
-            'currency'     => ['sometimes', 'string', 'size:3'],
-            'mode'         => ['sometimes', 'in:payment,hold'],
-            'reference'    => ['sometimes', 'string', 'max:120'],
-            // If you need to pass customer/payment_method ids, add them here
-        ]);
+        abort_unless($type === 'job', 404);
 
-        $currency = strtoupper($validated['currency'] ?? 'NZD');
-        $mode     = $validated['mode'] ?? 'payment';
+        /** @var Job $job */
+        $job = Job::findOrFail($id);
 
-        // Resolve the payee context (job or booking)
-        [$ownerType, $owner] = $this->resolveOwner($type, $id);
+        $currency       = $this->currencyFor($job);
+        $remainingCents = $this->remainingCents($job);
+        $flowHold       = $this->flowHoldCents($job);
 
-        // Optionally guard against invalid/closed states here
-        // abort_if($owner->status === 'cancelled', 422, 'Item is not payable.');
+        abort_if($remainingCents <= 0 && $flowHold <= 0, 422, 'Nothing to charge or hold.');
 
-        // Stripe
-        $secret = config('services.stripe.secret') ?: env('STRIPE_SECRET');
-        throw_if(empty($secret), ValidationException::withMessages(['stripe' => 'Stripe secret key is not configured.']));
-
-        $stripe = new StripeClient($secret);
+        $stripe = $this->stripe();
 
         try {
-            $params = [
-                'amount'                     => (int) $validated['amount_cents'],
-                'currency'                   => $currency,
-                'automatic_payment_methods'  => ['enabled' => true],
-                // You can include metadata to link back to your domain objects
-                'metadata'                   => array_filter([
-                    'owner_type' => $ownerType,
-                    'owner_id'   => (string) $owner->getKey(),
-                    'reference'  => Arr::get($validated, 'reference'),
-                    'app'        => config('app.name', 'Laravel'),
-                ]),
-            ];
-
-            // Manual capture for holds (aka "authorise" only)
-            if ($mode === 'hold') {
-                $params['capture_method'] = 'manual';
+            // Create the charge PI (balance) – not confirmed here
+            $chargePI = null;
+            if ($remainingCents > 0) {
+                $chargePI = $stripe->paymentIntents->create([
+                    'amount'               => $remainingCents,
+                    'currency'             => $currency,
+                    'confirmation_method'  => 'automatic',
+                    'capture_method'       => 'automatic',
+                    'metadata'             => [
+                        'type'     => 'balance',
+                        'job_id'   => (string) $job->id,
+                        'external' => (string) ($job->external_reference ?? ''),
+                    ],
+                    // Optional: keep card for later legitimate off-session use
+                    'setup_future_usage'   => 'off_session',
+                ], [
+                    // idempotency per job+operation
+                    'idempotency_key' => "bundle_charge_job_{$job->id}_" . uniqid('', true),
+                ]);
             }
 
-            $pi = $stripe->paymentIntents->create($params);
-
-            // If you want to persist a record linking this PI to your Job/Booking/Payment table, do it here.
-            // e.g., Payment::create([... 'stripe_payment_intent_id' => $pi->id, 'reference' => $validated['reference'] ?? null, ...]);
+            // Create the hold PI – manual capture (authorization)
+            $holdPI = null;
+            if ($flowHold > 0) {
+                $holdPI = $stripe->paymentIntents->create([
+                    'amount'               => $flowHold,
+                    'currency'             => $currency,
+                    'confirmation_method'  => 'automatic',
+                    'capture_method'       => 'manual', // <-- makes it a hold
+                    'metadata'             => [
+                        'type'     => 'hold',
+                        'job_id'   => (string) $job->id,
+                        'external' => (string) ($job->external_reference ?? ''),
+                    ],
+                    'payment_method_options' => [
+                        'card' => ['request_three_d_secure' => 'automatic'],
+                    ],
+                ], [
+                    'idempotency_key' => "bundle_hold_job_{$job->id}_" . uniqid('', true),
+                ]);
+            }
 
             return response()->json([
-                'ok'                 => true,
-                'mode'               => $mode,
-                'payment_intent_id'  => $pi->id,
-                'client_secret'      => $pi->client_secret,
+                'ok'                    => true,
+                'charge_client_secret'  => $chargePI?->client_secret,
+                'hold_client_secret'    => $holdPI?->client_secret,
             ]);
         } catch (Throwable $e) {
-            report($e);
+            Log::error('Bundle create failed', [
+                'job_id' => $job->id,
+                'err'    => $e->getMessage(),
+            ]);
+
             return response()->json([
                 'ok'      => false,
-                'message' => 'Unable to create PaymentIntent.',
+                'message' => 'Could not prepare payment bundle.',
             ], 422);
         }
-    }
-
-    /**
-     * Acknowledge that a manual-capture "hold" succeeded on the client.
-     *
-     * POST /p/pay/{type}/{id}/hold-recorded
-     * Body (optional):
-     * - payment_intent_id: string
-     * - reference: string
-     *
-     * Returns: 204 No Content (or 200 JSON if you prefer)
-     */
-    public function holdRecorded(Request $request, string $type, int $id)
-    {
-        // Make sure it’s a valid owner; throws 404 if not.
-        [, $owner] = $this->resolveOwner($type, $id);
-
-        // Optionally verify PI exists & is authorized:
-        // if ($piId = $request->string('payment_intent_id')->toString()) {
-        //     $secret = config('services.stripe.secret') ?: env('STRIPE_SECRET');
-        //     $stripe = new \Stripe\StripeClient($secret);
-        //     $pi = $stripe->paymentIntents->retrieve($piId);
-        //     abort_unless($pi && $pi->status === 'requires_capture', 422, 'Hold not in an authorizable state.');
-        // }
-
-        // Optionally persist a local flag / timestamp, or attach to a Payment row.
-        // $owner->forceFill(['latest_hold_recorded_at' => now()])->save();
-
-        return response()->noContent(); // 204
-    }
-
-    /**
-     * Resolve whether we’re dealing with a Job or Booking, returning [type, model].
-     *
-     * @return array{0:string,1:mixed}
-     */
-    protected function resolveOwner(string $type, int $id): array
-    {
-        $type = strtolower($type);
-
-        if ($type === 'job') {
-            /** @var Job $job */
-            $job = Job::query()->findOrFail($id);
-            return ['job', $job];
-        }
-
-        if ($type === 'booking') {
-            // Replace this with your real Booking model and import it.
-            // $booking = Booking::query()->findOrFail($id);
-            // return ['booking', $booking];
-
-            abort(404, 'Booking support is not enabled.');
-        }
-
-        abort(404, 'Unsupported owner type.');
     }
 }
