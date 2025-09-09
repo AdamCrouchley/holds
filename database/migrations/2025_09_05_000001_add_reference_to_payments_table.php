@@ -4,25 +4,26 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration
-{
-    /**
-     * Run the migrations.
-     */
+return new class extends Migration {
     public function up(): void
     {
+        if (!Schema::hasTable('payments')) return;
+
         Schema::table('payments', function (Blueprint $table) {
-            $table->string('reference')->nullable()->after('job_id');
+            if (!Schema::hasColumn('payments', 'reference')) {
+                $table->string('reference')->nullable()->after('job_id');
+            }
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
+        if (!Schema::hasTable('payments')) return;
+
         Schema::table('payments', function (Blueprint $table) {
-            $table->dropColumn('reference');
+            if (Schema::hasColumn('payments', 'reference')) {
+                $table->dropColumn('reference');
+            }
         });
     }
 };
