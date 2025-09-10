@@ -1,19 +1,17 @@
-@component('mail::message')
-# Payment Request
+@php
+    /** @var string $logoUrl */
+@endphp
 
-Hi {{ $job->customer_name ?? 'there' }},
+{{-- Logo via public URL --}}
+<p style="text-align:center;margin:0 0 8px;">
+    <img src="{{ $logoUrl }}" alt="Dream Drives" style="max-width:200px;height:auto;">
+</p>
 
-Please complete the payment for your booking **{{ $job->reference ?? $job->id }}**.
+# Complete your payment
 
-**Amount due:** ${{ $amount }}
+Hi{{ $job->customer_name ? ' ' . $job->customer_name : '' }},  
+Please complete payment for your reservation **{{ $reference }}** to secure your booking.
 
 @component('mail::button', ['url' => $payUrl])
-Pay Now
-@endcomponent
-
-If the button doesn’t work, copy and paste this link into your browser:  
-{{ $payUrl }}
-
-Thanks,  
-{{ config('app.name') }}
+Pay securely now
 @endcomponent

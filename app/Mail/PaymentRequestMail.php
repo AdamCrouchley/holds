@@ -11,30 +11,32 @@ class PaymentRequestMail extends Mailable
 {
     use Queueable, SerializesModels;
 
-    public function __construct(
-        public Job $job,
-        public string $payUrl,          // signed or token URL
-        public ?int $amountCents = null,// optional specific amount (e.g., deposit)
-        public ?string $purpose = null, // 'deposit' | 'balance' | 'payment'
-        public ?object $brand = null,   // Brand context (logo/url/colors)
-    ) {}
+    public Job $job;
+    public string $payUrl;
+    public string $logoUrl;
+
+    public function __construct(Job $job, ?string $payUrl = null)
+    {
+        $this->job    = $job;
+        $this->payUrl = $payUrl ?: route('portal.pay.show', $job);
+
+        // Serve logo via public/storage symlink
+        $this->logoUrl = asset('storage/branding/logo.png');
+    }
 
     public function build()
     {
-        $brand = $this->brand;
-        $subject = sprintf(
-            '%s — Secure payment link for Job #%d',
-            $brand->short_name ?? 'Dream Drives',
-            $this->job->id
-        );
+        // Always use the booking_reference field
+        $reference = $this->job->booking_reference
+            ?: ('RES-' . $this->job->getKey());
 
-        return $this->subject($subject)
-            ->markdown('mail.payment-request', [
-                'job'         => $this->job,
-                'payUrl'      => $this->payUrl,
-                'amountCents' => $this->amountCents,
-                'purpose'     => $this->purpose,
-                'brand'       => $brand,
+        return $this
+            ->subject('Payment request for booking ' . $reference)
+            ->markdown('emails.payment-request', [
+                'job'       => $this->job,
+                'payUrl'    => $this->payUrl,
+                'logoUrl'   => $this->logoUrl,
+                'reference' => $reference,
             ]);
     }
 }

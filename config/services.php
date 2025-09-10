@@ -63,18 +63,16 @@ return [
     // Payments
     // ----------------------------------------------------------------------
     'stripe' => [
-        'key'     => env('STRIPE_KEY'),
-        'secret'  => env('STRIPE_SECRET'),
-        'webhook' => [
-            'secret' => env('STRIPE_WEBHOOK_SECRET'),
-        ],
+        'key'            => env('STRIPE_KEY'),
+        'secret'         => env('STRIPE_SECRET'),
+        'webhook_secret' => env('STRIPE_WEBHOOK_SECRET'),
     ],
 
+    // ----------------------------------------------------------------------
+    // Magic Links
+    // ----------------------------------------------------------------------
     'magic_links' => [
-    'secret' => env('e253034765712bdcd2cd332f98f9a16aae70be7c7d157840cb0e395b04f97901'),
-],
+        'secret' => env('MAGIC_LINKS_SECRET'),
+    ],
 
 ];
-
-
-

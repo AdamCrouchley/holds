@@ -11,6 +11,7 @@ use Filament\Actions;
 use Filament\Forms;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\URL;
 
 class ViewJob extends ViewRecord
@@ -77,24 +78,41 @@ class ViewJob extends ViewRecord
         ];
     }
 
+    /**
+     * Invoked by the "Email payment request" action.
+     * Uses the STATIC wrapper and surfaces the returned message.
+     * Expects: JobController::emailPaymentRequestStatic(Job $job, array $payload): array{0: bool, 1: string}
+     */
     public function sendPaymentRequest(): void
     {
         /** @var Job $job */
         $job = $this->getRecord();
 
         try {
-            // If you want to prefill: request()->merge(['to' => 'customer@example.com', 'subject' => '...', 'message' => '...']);
-            app()->call([JobController::class, 'emailPaymentRequest'], [
-                'request' => request(),
-                'job'     => $job,
+            // Prefill or override as desired
+            $payload = []; // e.g. ['to' => $job->customer_email]
+
+            [$ok, $msg] = JobController::emailPaymentRequestStatic($job, $payload);
+
+            if ($ok) {
+                Notification::make()
+                    ->title('Payment request sent')
+                    ->body($msg ?: 'An email with the payment link has been sent to the customer.')
+                    ->success()
+                    ->send();
+            } else {
+                Notification::make()
+                    ->title('Failed to send email')
+                    ->body($msg ?: 'Mailer reported a problem. Check logs for details.')
+                    ->danger()
+                    ->send();
+            }
+        } catch (\Throwable $e) {
+            Log::error('Email payment request failed from ViewJob', [
+                'job_id' => $job->getKey(),
+                'err'    => $e->getMessage(),
             ]);
 
-            Notification::make()
-                ->title('Payment request sent')
-                ->body('An email with the payment link has been sent to the customer.')
-                ->success()
-                ->send();
-        } catch (\Throwable $e) {
             Notification::make()
                 ->title('Failed to send email')
                 ->body($e->getMessage())
@@ -105,7 +123,6 @@ class ViewJob extends ViewRecord
 
     /**
      * Always return a SIGNED URL (includes ?expires=&signature=).
-     * Requires the named route 'portal.pay.show.job' to exist and be ->middleware('signed').
      */
     protected function signedPayUrl(Job $job): string
     {

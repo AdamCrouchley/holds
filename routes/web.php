@@ -2,6 +2,7 @@
 
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Http\Request;
 use App\Http\Middleware\VerifyCsrfToken;
 
@@ -24,9 +25,26 @@ use App\Http\Controllers\SyncController;
 use App\Http\Controllers\VevsWebhookController;
 use App\Http\Controllers\WebhookController;
 
+
+Route::post('/p/job/{job}/paid', [PayController::class, 'recordJobPaid'])
+    ->whereNumber('job')
+    ->name('portal.pay.recordPaid');   // ← legacy name expected by Blade
+
+
+// Legacy alias so the Blade helper works:
+// POST /p/job/{job}/intent  → PayController@intent('job', {job})
+Route::post('/p/job/{job}/intent', function (Request $request, int $job) {
+    return app(PayController::class)->intent($request, 'job', $job);
+})
+    ->whereNumber('job')
+    ->withoutMiddleware([VerifyCsrfToken::class])   // public portal form posts
+    ->name('portal.pay.intent.job');
+
+
+
 /*
 |--------------------------------------------------------------------------
-| Public home
+| Public: Home
 |--------------------------------------------------------------------------
 */
 Route::get('/', fn () => view('welcome'))->name('home');
@@ -45,7 +63,7 @@ Route::pattern('job',      '[0-9]+');
 
 /*
 |--------------------------------------------------------------------------
-| SMTP smoke test
+| Debug / SMTP smoke tests (throttled)
 |--------------------------------------------------------------------------
 */
 Route::get('/mail-test', function () {
@@ -57,57 +75,19 @@ Route::get('/mail-test', function () {
     } catch (\Throwable $e) {
         return '❌ Mail failed: ' . $e->getMessage();
     }
-})->name('debug.mail_test');
+})->middleware('throttle:3,1')->name('debug.mail_test');
 
-/*
-|--------------------------------------------------------------------------
-| Portal Pay (used by pay.blade and share links)
-|--------------------------------------------------------------------------
-|
-| - GET  /p/job/{job}/pay              -> PayController@show
-| - GET  /p/pay/t/{token}              -> PayController@showByToken
-| - GET  /p/job/{job}/pay/url          -> PayController@url
-| - POST /p/job/{job}/paid             -> PayController@recordPaid      <-- NEW
-| - POST /p/{type}/{id}/intent         -> PayController@intent
-| - POST /p/{type}/{id}/hold-recorded  -> PayController@holdRecorded
-| - POST /p/{type}/{id}/bundle         -> PayController@bundle
-|
-*/
-Route::middleware('web')->group(function () {
-    // Pay page by Job id
-    Route::get('/p/job/{job}/pay', [PayController::class, 'show'])
-        ->name('portal.pay.show.job');
-
-    // Pay page by token
-    Route::get('/p/pay/t/{token}', [PayController::class, 'showByToken'])
-        ->name('portal.pay.show.token');
-
-    // JSON helper to fetch a shareable URL
-    Route::get('/p/job/{job}/pay/url', [PayController::class, 'url'])
-        ->name('portal.pay.url');
-
-    // NEW: record a paid payment for a Job
-    Route::post('/p/job/{job}/paid', [PayController::class, 'recordPaid'])
-        ->whereNumber('job')
-        ->name('portal.pay.recordPaid');
-
-    // Optional stubs used by the front-end
-    Route::post('/p/{type}/{id}/intent', [PayController::class, 'intent'])
-        ->where('type', 'job|booking')
-        ->whereNumber('id')
-        ->name('portal.pay.intent');
-
-    Route::post('/p/{type}/{id}/hold-recorded', [PayController::class, 'holdRecorded'])
-        ->where('type', 'job|booking')
-        ->whereNumber('id')
-        ->name('portal.pay.hold-recorded');
-
-    // Bundle endpoint (e.g., to create PI + SI together)
-    Route::post('/p/{type}/{id}/bundle', [PayController::class, 'bundle'])
-        ->where('type', 'job|booking')
-        ->whereNumber('id')
-        ->name('portal.pay.bundle');
-});
+Route::get('/test-mail', function () {
+    try {
+        Mail::raw('Test from Holds app route', function ($msg) {
+            $msg->to('apcrouchley@gmail.com')->subject('Holds Route Test');
+        });
+        return 'Mail dispatched — check inbox (or logs if using mailer=log).';
+    } catch (\Throwable $e) {
+        Log::error('Mail test failed: ' . $e->getMessage());
+        return 'Mail failed: ' . $e->getMessage();
+    }
+})->middleware('throttle:3,1');
 
 /*
 |--------------------------------------------------------------------------
@@ -118,10 +98,10 @@ Route::get('/vevs/landing', [PortalController::class, 'vevsLanding'])->name('vev
 
 /*
 |--------------------------------------------------------------------------
-| Portal routes (/p/*) – customer area
+| Portal routes (/p/*) – customer area (Booking-aware)
 |--------------------------------------------------------------------------
 */
-Route::get('/p',           [PortalController::class, 'home'])->name('portal.home');
+Route::get('/p', [PortalController::class, 'home'])->name('portal.home');
 Route::get('/p/dashboard', fn () => redirect()->route('portal.home'))->name('portal.dashboard');
 
 /** Booking-aware payment page (authenticated) */
@@ -129,36 +109,40 @@ Route::get('/p/pay/{booking}', [PortalController::class, 'pay'])
     ->whereNumber('booking')
     ->name('portal.pay');
 
-/** Payment Element – create/reuse Balance PaymentIntent */
-Route::post('/p/pay/{booking}/intent', [PaymentController::class, 'createOrReuseBalanceIntent'])
+/** Payment Element – create/reuse Balance PaymentIntent (booking-aware) */
+Route::post('/p/pay/{booking}/intent', [PaymentController::class, 'portalCreateIntent'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('portal.pay.intent.booking');
 
-/** SetupIntent (store card for off-session) */
+/** (Optional) SetupIntent to store card for off-session */
 Route::post('/p/pay/{booking}/setup', [PaymentController::class, 'createSetupIntent'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('portal.pay.setup');
 
-/** Finalize checkout */
+/** Finalize checkout (POST form fallback) */
 Route::post('/p/pay/{booking}/finalize', [PaymentController::class, 'finalizeCheckout'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('portal.pay.finalize');
 
-/** Completion return URL */
+/** Completion return URL (GET) */
 Route::get('/p/pay/{booking}/complete', [PaymentController::class, 'portalComplete'])
     ->whereNumber('booking')
     ->name('portal.pay.complete');
 
 /** HOLD (manual capture) */
-Route::post('/p/hold/{booking}/intent',  [PaymentController::class, 'portalCreateHoldIntent'])
+Route::post('/p/hold/{booking}/intent', [PaymentController::class, 'portalCreateHoldIntent'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('portal.hold.intent');
 
 Route::get('/p/hold/{booking}/complete', [PaymentController::class, 'portalCompleteHold'])
     ->whereNumber('booking')
     ->name('portal.hold.complete');
 
-/** Post-hire off-session confirmation */
+/** Post-hire off-session confirmation (Stripe redirect return) */
 Route::get('/p/post-charge/confirm', function (Request $request) {
     return view('portal.post-charge-confirm', [
         'clientSecret' => $request->query('payment_intent_client_secret'),
@@ -175,16 +159,81 @@ Route::get('/p/t', [PortalController::class, 'magicLink'])->name('portal.magic')
 
 /*
 |--------------------------------------------------------------------------
-| Tokenized hosted payment pages (/p/pay/{token}) – legacy
+| Canonical Job-based customer payment flow
+| -> Namespaced to portal.pay.job.* to avoid collisions with booking routes
 |--------------------------------------------------------------------------
 */
-Route::get('/p/pay/{token}',          [PaymentController::class, 'showPortalPay'])->name('portal.pay.token');
-Route::post('/p/pay/{token}/intent',  [PaymentController::class, 'createOrReuseBalanceIntent'])->name('portal.pay.intent.token');
-Route::post('/p/pay/{token}/confirm', [PaymentController::class, 'markPaid'])->name('portal.pay.confirm');
+Route::prefix('portal/jobs/{job}/pay')->name('portal.pay.job.')->group(function () {
+    Route::get('/',         [PayController::class, 'show'])      ->whereNumber('job')->name('show');
+    Route::post('/intent',  [PayController::class, 'intent'])    ->whereNumber('job')->name('intent');
+    Route::post('/bundle',  [PayController::class, 'bundle'])    ->whereNumber('job')->name('bundle');
+    Route::post('/paid',    [PayController::class, 'recordPaid'])->whereNumber('job')->name('recordPaid');
+    Route::get('/complete', [PayController::class, 'complete'])  ->whereNumber('job')->name('complete');
+});
 
 /*
 |--------------------------------------------------------------------------
-| Generic token landing under /p/{token} (non-payment)
+| Back-compat helpers (legacy routes still in the wild)
+|--------------------------------------------------------------------------
+*/
+Route::get('/p/job/{job}/pay', [PayController::class, 'show'])
+    ->whereNumber('job')
+    ->name('portal.pay.show.job');
+
+Route::get('/p/pay/t/{token}', [PayController::class, 'showByToken'])
+    ->name('portal.pay.show.token');
+
+Route::get('/p/job/{job}/pay/url', [PayController::class, 'url'])
+    ->whereNumber('job')
+    ->name('portal.pay.url');
+
+Route::post('/p/job/{job}/bundle', [PayController::class, 'bundle'])
+    ->whereNumber('job')
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.bundle.job');
+
+Route::get('/p/job/{job}/complete', [PayController::class, 'complete'])
+    ->whereNumber('job')
+    ->name('portal.pay.job.complete.legacy');
+
+/** Generic helpers retained (some older JS may call these) */
+Route::post('/p/{type}/{id}/intent', [PayController::class, 'intent'])
+    ->where('type', '(job|booking)')
+    ->whereNumber('id')
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.intent');
+
+Route::post('/p/{type}/{id}/bundle', [PayController::class, 'bundle'])
+    ->where('type', '(job|booking)')
+    ->whereNumber('id')
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.bundle');
+
+Route::post('/p/{type}/{id}/hold-recorded', [PayController::class, 'holdRecorded'])
+    ->where('type', '(job|booking)')
+    ->whereNumber('id')
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.hold-recorded');
+
+/*
+|--------------------------------------------------------------------------
+| Tokenized hosted payment pages (/p/pay/{token}) – legacy token flow
+|--------------------------------------------------------------------------
+*/
+Route::get('/p/pay/{token}',          [PaymentController::class, 'showPortalPay'])
+    ->name('portal.pay.token');
+
+Route::post('/p/pay/{token}/intent',  [PaymentController::class, 'createOrReuseBalanceIntent'])
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.intent.token');
+
+Route::post('/p/pay/{token}/confirm', [PaymentController::class, 'markPaid'])
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('portal.pay.confirm');
+
+/*
+|--------------------------------------------------------------------------
+| Generic token landing under /p/{token} (non-payment) — keep LAST
 |--------------------------------------------------------------------------
 */
 Route::get('/p/{token}', [PortalController::class, 'show'])->name('portal.show');
@@ -224,7 +273,9 @@ Route::post('/p/login-classic', [PortalAuthController::class, 'attempt'])->name(
 Route::prefix('portal')->group(function () {
     // Tokenised public HPP/landing
     Route::get('/{token}',          [PortalController::class, 'show'])->name('portal.token.show');
-    Route::post('/{token}/intent',  [PortalController::class, 'upsertIntent'])->name('portal.intent');
+    Route::post('/{token}/intent',  [PortalController::class, 'upsertIntent'])
+        ->withoutMiddleware([VerifyCsrfToken::class])
+        ->name('portal.intent');
     Route::get('/{token}/complete', [PortalController::class, 'complete'])->name('portal.complete');
 
     // Authenticated area
@@ -263,27 +314,32 @@ Route::get('/customer/dashboard', fn () => view('customer.dashboard'))
 */
 Route::post('/bookings/{booking}/deposit', [PaymentController::class, 'deposit'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('booking.deposit');
 
 Route::post('/bookings/{booking}/balance', [PaymentController::class, 'balance'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('booking.balance');
 
 /*
 |--------------------------------------------------------------------------
-| Card deposit "hold" and capture/void
+| Card deposit "hold" and capture/void (legacy DepositController)
 |--------------------------------------------------------------------------
 */
-Route::post('/bookings/{booking}/hold',    [DepositController::class, 'authorise'])
+Route::post('/bookings/{booking}/hold', [DepositController::class, 'authorise'])
     ->whereNumber('booking')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('booking.hold');
 
 Route::post('/deposits/{deposit}/capture', [DepositController::class, 'capture'])
     ->whereNumber('deposit')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('deposit.capture');
 
-Route::post('/deposits/{deposit}/void',    [DepositController::class, 'void'])
+Route::post('/deposits/{deposit}/void', [DepositController::class, 'void'])
     ->whereNumber('deposit')
+    ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('deposit.void');
 
 /*
@@ -297,7 +353,7 @@ Route::middleware(['auth'])->group(function () {
         ->whereNumber('booking')
         ->name('admin.bookings.post_charge');
 
-    // Holds capture/release
+    // Holds capture/release (new PaymentController paths)
     Route::post('/admin/hold/{payment}/capture', [PaymentController::class, 'captureHold'])
         ->whereNumber('payment')
         ->name('admin.hold.capture');
@@ -306,108 +362,16 @@ Route::middleware(['auth'])->group(function () {
         ->whereNumber('payment')
         ->name('admin.hold.release');
 
-    // Admin: Customer payment methods
-    Route::get('/admin/customers/{customer}/payment-method',          [PaymentMethodController::class, 'show'])->name('customers.pm.add');
-    Route::post('/admin/customers/{customer}/payment-method/intent',  [PaymentMethodController::class, 'createSetupIntent'])->name('customers.pm.intent');
-    Route::post('/admin/customers/{customer}/payment-method/default', [PaymentMethodController::class, 'setDefault'])->name('customers.pm.default');
-
-    // Admin: DreamDrives integration
-    Route::post('/admin/integrations/dreamdrives/sync', function (Request $request) {
-        $mode = $request->string('mode')->toString() ?: 'week_made';
-        if ($mode === 'week_pickup') {
-            dispatch(new \App\Jobs\SyncDreamDrivesWeekPickup);
-            return back()->with('status', 'DreamDrives sync (week pickup) queued');
-        }
-        dispatch(new \App\Jobs\SyncDreamDrivesWeekMade);
-        return back()->with('status', 'DreamDrives sync (week made) queued');
-    })->middleware('throttle:3,1')->name('admin.integrations.dreamdrives.sync');
-
-    // Admin: Email payment request from Job
-    Route::post('/admin/jobs/{job}/email-payment-request', [JobController::class, 'emailPaymentRequest'])
-        ->whereNumber('job')
-        ->name('admin.jobs.email-payment-request');
+    // Deposits / holds index (uses deposits table + view)
+    Route::get('admin/holds', [PaymentController::class, 'holdsIndex'])
+    ->name('admin.holds.index');
 });
 
 /*
 |--------------------------------------------------------------------------
-| Alias: /portal/pay/job/{job} → canonical job pay route
-|--------------------------------------------------------------------------
-*/
-Route::get('/portal/pay/job/{job}', fn (int $job) =>
-    redirect()->route('portal.pay.show.job', ['job' => $job])
-)->name('portal.pay.job');
-
-/*
-|--------------------------------------------------------------------------
-| Sync by reference
-|--------------------------------------------------------------------------
-*/
-Route::post('/sync/by-reference/{reference?}', [SyncController::class, 'byReference'])
-    ->name('sync.byReference');
-
-/*
-|--------------------------------------------------------------------------
-| Public API v1
-|--------------------------------------------------------------------------
-*/
-Route::prefix('v1')
-    ->withoutMiddleware([VerifyCsrfToken::class])
-    ->middleware('throttle:10,1')
-    ->group(function () {
-        Route::post('/triggers/payment-request', [TriggerController::class, 'paymentRequest'])
-            ->name('api.triggers.payment_request');
-    });
-
-/*
-|--------------------------------------------------------------------------
-| Webhooks
+| Stripe webhooks
 |--------------------------------------------------------------------------
 */
 Route::post('/webhooks/stripe', [WebhookController::class, 'handle'])
     ->withoutMiddleware([VerifyCsrfToken::class])
     ->name('webhooks.stripe.web');
-
-Route::post('/webhooks/vevs', [VevsWebhookController::class, 'handle'])
-    ->withoutMiddleware([VerifyCsrfToken::class])
-    ->name('webhooks.vevs');
-
-/*
-|--------------------------------------------------------------------------
-| Static policy pages
-|--------------------------------------------------------------------------
-*/
-Route::view('/portal/terms', 'portal.terms')->name('portal.terms');
-Route::view('/portal/bond-policy', 'portal.bond-policy')->name('portal.bond.policy');
-
-/*
-|--------------------------------------------------------------------------
-| Admin helper
-|--------------------------------------------------------------------------
-*/
-Route::get('/admin/bookings/{booking}/payment-link', [PaymentController::class, 'paymentLink'])
-    ->middleware(['auth'])
-    ->whereNumber('booking')
-    ->name('admin.booking.payment-link');
-
-/*
-|--------------------------------------------------------------------------
-| Healthcheck & DB check
-|--------------------------------------------------------------------------
-*/
-Route::get('/_up', fn () => response()->json(['ok' => true]))->name('health');
-
-Route::get('/_db-check', function () {
-    return response()->json([
-        'env'        => app()->environment(),
-        'default'    => config('database.default'),
-        'sqlite_db'  => config('database.connections.sqlite.database'),
-        'columns'    => \Schema::getColumnListing('bookings'),
-    ]);
-});
-
-/*
-|--------------------------------------------------------------------------
-| Fallback 404
-|--------------------------------------------------------------------------
-*/
-Route::fallback(fn () => response()->view('errors.404', [], 404));

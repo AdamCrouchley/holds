@@ -5,12 +5,15 @@ namespace App\Http\Controllers;
 use App\Models\Booking;
 use App\Models\Customer;
 use App\Models\Payment;
+use App\Models\Job;
+use App\Models\Deposit;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Str;
+use Illuminate\View\View;
 use Stripe\StripeClient;
 use Throwable;
 
@@ -406,10 +409,6 @@ class PaymentController extends Controller
      | ------------------------------ LEGACY TOKEN FLOW ------------------------
      * ========================================================================= */
 
-    /**
-     * Show the portal pay page using a public token, and provide client secrets.
-     * Also flashes `needs_hold` so your JS can auto-start the hold if required.
-     */
     public function showPortalPay(string $token)
     {
         $booking = Booking::query()
@@ -425,7 +424,7 @@ class PaymentController extends Controller
             session()->flash('needs_hold', true);
         }
 
-        return view('portal/pay', [
+        return view('portal.pay', [
             'booking'             => $booking,
             'user'                => $booking->customer,
             'stripeKey'           => config('services.stripe.key'),
@@ -436,7 +435,7 @@ class PaymentController extends Controller
         ]);
     }
 
-    /** Legacy: create/reuse a balance PI via token (kept for compatibility) */
+    /** Legacy: create/reuse a balance PI via token */
     public function createOrReuseBalanceIntent(Request $request, string $token)
     {
         $booking = Booking::with(['customer','payments'])->where('portal_token', $token)->firstOrFail();
@@ -520,13 +519,13 @@ class PaymentController extends Controller
         );
 
         $pi = $stripe->paymentIntents->create([
-            'amount'               => $amount,
-            'currency'             => strtolower($currency),
-            'customer'             => $custId,
-            'confirmation_method'  => 'automatic',
-            'setup_future_usage'   => 'off_session',
-            'description'          => "Booking balance {$booking->reference}",
-            'metadata'             => [
+            'amount'                    => $amount,
+            'currency'                  => strtolower($currency),
+            'customer'                  => $custId,
+            'automatic_payment_methods' => ['enabled' => true],
+            'setup_future_usage'        => 'off_session',
+            'description'               => "Booking balance {$booking->reference}",
+            'metadata'                  => [
                 'booking_id' => (string) $booking->id,
                 'payment_id' => (string) $payment->id,
                 'purpose'    => 'booking_balance',
@@ -552,7 +551,7 @@ class PaymentController extends Controller
     {
         $token = $this->ensurePortalToken($booking);
         return response()->json([
-            'url' => route('portal.pay.token', $token),
+            'url' => route('portal.pay.token', ['token' => $token]),
         ]);
     }
 
@@ -740,7 +739,7 @@ class PaymentController extends Controller
 
     protected function portalCompleteGeneric(Request $request, Booking $booking, string $purpose)
     {
-        $piId = $request->query('payment_intent');
+        $piId = $request->query('payment_intent') ?: $request->input('payment_intent');
         abort_if(!$piId, 400, 'Missing payment_intent');
 
         $stripe = $this->stripe();
@@ -869,11 +868,6 @@ class PaymentController extends Controller
      | ------------------------------ NEW HELPERS ------------------------------
      * ========================================================================= */
 
-    /**
-     * Ensure all PaymentIntents needed for the portal exist and return their client_secrets.
-     * - balance: normal charge for outstanding balance (if any)
-     * - bond: manual-capture authorization for the hold (if any)
-     */
     private function ensurePortalIntents(Booking $booking): array
     {
         $stripe   = $this->stripe();
@@ -891,7 +885,7 @@ class PaymentController extends Controller
             'bond'    => null,
         ];
 
-        // BALANCE PI (only if there’s a balance to pay)
+        // BALANCE
         $balanceCents = $this->computeBalanceCents($booking);
         if ($balanceCents > 0) {
             $balanceCol = Schema::hasColumn('bookings', 'stripe_balance_pi_id') ? 'stripe_balance_pi_id' : null;
@@ -934,7 +928,7 @@ class PaymentController extends Controller
             $secrets['balance'] = $pi->client_secret ?? null;
         }
 
-        // BOND HOLD PI (manual capture) — required if hold_amount > 0 and not finalized
+        // BOND HOLD (manual capture)
         $holdCents = (int) ($booking->hold_amount ?? 0);
         $bondCol   = Schema::hasColumn('bookings', 'stripe_bond_pi_id') ? 'stripe_bond_pi_id' : null;
         $bondAlreadyFinalized = !empty($booking->bond_released_at) || !empty($booking->bond_captured_at);
@@ -962,7 +956,7 @@ class PaymentController extends Controller
                     'amount'                    => $holdCents,
                     'currency'                  => $currency,
                     'customer'                  => $stripeCustomerId,
-                    'capture_method'            => 'manual', // authorization/hold
+                    'capture_method'            => 'manual',
                     'description'               => 'Bond hold: ' . ($booking->reference ?? $booking->id),
                     'metadata'                  => [
                         'booking_id' => (string) $booking->id,
@@ -982,10 +976,6 @@ class PaymentController extends Controller
         return $secrets;
     }
 
-    /**
-     * Compute balance (in cents) from booking totals minus successful payments (excluding holds).
-     * Falls back to $booking->balance_due if your schema maintains it.
-     */
     private function computeBalanceCents(Booking $booking): int
     {
         if (isset($booking->balance_due) && $booking->balance_due !== null) {
@@ -1003,10 +993,6 @@ class PaymentController extends Controller
         return max(0, $total - $paid);
     }
 
-    /**
-     * Do we already have a live/usable hold for this booking?
-     * Accept statuses placing an authorization that can be captured.
-     */
     private function hasActiveHold(Booking $booking): bool
     {
         if (!empty($booking->bond_captured_at) || !empty($booking->bond_released_at)) {
@@ -1016,11 +1002,111 @@ class PaymentController extends Controller
         $q = $booking->payments()
             ->where(function ($q) {
                 $q->where('purpose', 'hold')
-                  ->orWhere('type', 'hold');
+                  ->orWhere('type', 'hold')
+                  ->orWhere('mechanism', 'hold');
             })
             ->whereIn('status', ['requires_capture','processing','succeeded'])
             ->whereNotNull('stripe_payment_intent_id');
 
         return $q->exists();
+    }
+
+    /* =========================================================================
+     | ------------------------------ ADMIN UI: Holds index (DEPOSITS table) ---
+     * ========================================================================= */
+
+    public function holdsIndex(Request $request): View
+    {
+        // Avoid 500s if migration hasn’t been run yet
+        if (!Schema::hasTable('deposits')) {
+            abort(503, 'The deposits table does not exist. Run the deposits migration.');
+        }
+
+        $validated = $request->validate([
+            'q'       => ['nullable', 'string', 'max:200'],
+            'status'  => ['nullable', 'in:authorized,captured,released,canceled,failed'],
+            'perPage' => ['nullable', 'integer', 'min:10', 'max:200'],
+        ]);
+
+        $perPage = (int) ($validated['perPage'] ?? 25);
+
+        $q      = $validated['q'] ?? null;
+        $status = $validated['status'] ?? null;
+
+        $query = Deposit::query()
+            ->with(['booking', 'customer'])
+            ->orderByDesc('id');
+
+        if ($status) {
+            $query->where('status', $status);
+        }
+
+        if ($q) {
+            // escape \, %, _
+            $raw  = str_replace('\\', '\\\\', (string) $q);
+            $like = '%' . str_replace(['%','_'], ['\%','\_'], $raw) . '%';
+
+            $query->where(function ($w) use ($like, $q) {
+                $w->where('stripe_payment_intent_id', 'like', $like)
+                  ->orWhere('stripe_payment_intent', 'like', $like)
+                  ->orWhere('stripe_payment_method_id', 'like', $like)
+                  ->orWhere('stripe_payment_method', 'like', $like)
+                  ->orWhere('last4', 'like', $like)
+                  ->orWhere('currency', 'like', $like)
+                  ->orWhere('failure_code', 'like', $like)
+                  ->orWhere('failure_message', 'like', $like)
+                  ->orWhereHas('booking', fn($b) => $b->where('id', (int) $q))
+                  ->orWhereHas('customer', function ($c) use ($like) {
+                      $c->where('email', 'like', $like)
+                        ->orWhere('first_name', 'like', $like)
+                        ->orWhere('last_name', 'like', $like);
+                  });
+            });
+        }
+
+        $deposits = $query->paginate($perPage)->withQueryString();
+
+        return view('admin.deposits.index', [
+            'deposits' => $deposits,
+            'filters'  => [
+                'q'      => $q,
+                'status' => $status,
+                'perPage'=> $perPage,
+            ],
+        ]);
+    }
+
+    /* =========================================================================
+     | ------------------------------ COMPAT SHIMS -----------------------------
+     | Added so all existing routes have matching methods.
+     * ========================================================================= */
+
+    /** Create a SetupIntent to store a card for off-session use */
+    public function createSetupIntent(Request $request, Booking $booking)
+    {
+        $customer = $booking->customer ?: $this->portalCustomer();
+        $stripeCustomerId = $this->ensureStripeCustomer($customer);
+
+        $si = $this->stripe()->setupIntents->create([
+            'customer' => $stripeCustomerId,
+            'usage'    => 'off_session',
+            'payment_method_types' => ['card'],
+        ]);
+
+        return response()->json([
+            'ok'           => true,
+            'clientSecret' => $si->client_secret,
+            'setupIntent'  => $si->id,
+        ]);
+    }
+
+    /**
+     * Finalize checkout (POST) – accepts payment_intent in body and runs the same
+     * completion logic as the GET /complete route.
+     */
+    public function finalizeCheckout(Request $request, Booking $booking)
+    {
+        // Delegate to the generic path with purpose "booking_balance"
+        return $this->portalCompleteGeneric($request, $booking, 'booking_balance');
     }
 }

@@ -6,11 +6,13 @@ namespace App\Http\Controllers;
 
 use App\Models\Job;
 use Illuminate\Http\Request;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\URL;
 
-// Optional mailables (guarded via class_exists).
+// Optional mailables (guarded via class_exists)
 use App\Mail\PaymentRequestMail;
 use App\Mail\PaymentReceiptMail;
 use App\Mail\HoldPlacedMail;
@@ -19,18 +21,11 @@ use App\Mail\HoldReleasedMail;
 class JobController extends Controller
 {
     /**
+     * ROUTE HANDLER (instance method)
      * POST /admin/jobs/{job}/email-payment-request
-     *
-     * Accepts optional fields:
-     *  - to, cc, bcc (emails)
-     *  - subject (string)
-     *  - message (string, extra note to include in email body)
-     *  - amount_cents (int), type (string: deposit|balance|total|custom)
      */
-    public function emailPaymentRequest(Request $request, Job $job)
+    public function emailPaymentRequest(Request $request, Job $job): JsonResponse|RedirectResponse
     {
-        // $this->authorize('emailPaymentRequest', $job); // optional
-
         $data = $request->validate([
             'to'           => ['nullable', 'email'],
             'cc'           => ['nullable', 'email'],
@@ -41,62 +36,92 @@ class JobController extends Controller
             'type'         => ['nullable', 'string', 'in:deposit,balance,total,custom'],
         ]);
 
-        // Recipient resolution
+        [$ok, $msg] = $this->sendPaymentRequestInternal($job, $data);
+
+        return $this->respond($request, $ok ? 200 : 500, $msg);
+    }
+
+    /**
+     * STATIC WRAPPER (callable from jobs/commands/other controllers)
+     * Example: JobController::emailPaymentRequestStatic($job, ['to' => 'x@y.com'])
+     */
+public static function emailPaymentRequestStatic(Job $job, array $data = []): array
+{
+    try {
+        // Use a lightweight instance to reuse internal logic
+        $self = app(static::class);
+        [$ok, $msg] = $self->sendPaymentRequestInternal($job, $data);
+
+        if (!$ok) {
+            Log::error('emailPaymentRequestStatic failed', [
+                'job_id' => $job->getKey(),
+                'msg'    => $msg,
+            ]);
+        }
+
+        return [$ok, $msg];
+    } catch (\Throwable $e) {
+        Log::error('emailPaymentRequestStatic threw', [
+            'job_id' => $job->getKey(),
+            'err'    => $e->getMessage(),
+        ]);
+        return [false, 'Mailer threw: ' . $e->getMessage()];
+    }
+}
+
+
+    /* ============================== MAIL HELPERS ============================== */
+
+    /** Shared logic used by both instance route and static wrapper. */
+    private function sendPaymentRequestInternal(Job $job, array $data): array
+    {
+        // Resolve recipient
         $to = $data['to']
             ?? optional($job->customer)->email
             ?? $job->customer_email
             ?? null;
 
         if (!$to) {
-            return $this->respond(
-                $request,
-                422,
-                'No recipient email address found. Provide ?to=... or set a customer email on the Job.'
-            );
+            return [false, 'No recipient email address found. Provide `to` or set a customer email on the Job.'];
         }
 
-        // Signed pay URL (ensure route has signed middleware if you rely on it)
-        $payUrl = URL::signedRoute('portal.pay.show.job', ['job' => $job->getKey()]);
-
-        // Amount / hold hints
-        $currency   = $job->currency ?? 'NZD';
-        $dueCents   = $data['amount_cents']
+        // Build link (signed route to your job pay page)
+        $payUrl   = URL::signedRoute('portal.pay.show.job', ['job' => $job->getKey()]);
+        $currency = $job->currency ?? 'NZD';
+        $dueCents = $data['amount_cents']
             ?? $job->remaining_cents
             ?? $job->amount_due_cents
             ?? $job->due_cents
             ?? null;
 
-        $holdCents  = $job->bond_cents
-            ?? $job->hold_cents
-            ?? null;
+        $holdCents = $job->bond_cents ?? $job->hold_cents ?? null;
 
-        $reference  = $job->reference ?? ('Job #' . $job->getKey());
-        $type       = $data['type'] ?? ($dueCents !== null ? 'total' : 'custom');
+        $reference = $job->reference ?? ('Job #' . $job->getKey());
+        $type      = $data['type'] ?? ($dueCents !== null ? 'total' : 'custom');
 
-        $subject    = $data['subject'] ?? "Payment request for {$reference}";
-        $note       = trim((string)($data['message'] ?? ''));
+        $subject = $data['subject'] ?? "Payment request for {$reference}";
+        $note    = trim((string)($data['message'] ?? ''));
 
         $customerName = optional($job->customer)->first_name
             ?? optional($job->customer)->name
             ?? $job->customer_name
             ?? 'there';
 
-        $brand = $job->brand ?? (object) [
-            'short_name'     => 'Dream Drives',
-            'email_logo_url' => null,
-        ];
+        // IMPORTANT CHANGE: do not pass a Brand object (avoid missing Brand model)
+        $brand = null;
 
         try {
             if (class_exists(PaymentRequestMail::class)) {
-                // Prefer your dedicated Mailable if present
-                $mailable = new PaymentRequestMail($job, $payUrl, $dueCents, $type, $brand);
+                $mailable = (new PaymentRequestMail($job, $payUrl, $dueCents, $type, $brand))
+                    ->subject($subject)
+                    ->with(['note' => $note, 'holdCents' => $holdCents, 'currency' => $currency]);
 
-                Mail::to($to)
-                    ->when(!empty($data['cc']), fn($m) => $m->cc($data['cc']))
-                    ->when(!empty($data['bcc']), fn($m) => $m->bcc($data['bcc']))
-                    ->send($mailable->subject($subject)->with(['note' => $note, 'holdCents' => $holdCents]));
+                $pending = Mail::to($to);
+                if (!empty($data['cc']))  $pending->cc($data['cc']);
+                if (!empty($data['bcc'])) $pending->bcc($data['bcc']);
+                $pending->send($mailable);
             } else {
-                // Inline HTML fallback (no view required)
+                // Fallback inline HTML
                 $html = $this->buildEmailHtml(
                     customerName: $customerName,
                     reference: $reference,
@@ -122,26 +147,19 @@ class JobController extends Controller
                 'type'    => $type,
             ]);
 
-            return $this->respond($request, 200, "Payment request sent to {$to}.");
+            return [true, "Payment request sent to {$to}."];
         } catch (\Throwable $e) {
             Log::error('Payment request email failed', [
-                'job_id'  => $job->getKey(),
-                'to'      => $to,
-                'error'   => $e->getMessage(),
+                'job_id' => $job->getKey(),
+                'to'     => $to,
+                'error'  => $e->getMessage(),
             ]);
-
-            return $this->respond($request, 500, 'Failed to send email: ' . $e->getMessage());
+            return [false, 'Failed to send email: ' . $e->getMessage()];
         }
     }
 
-    /* ============================== MAIL HELPERS ============================== */
-
     /**
-     * Call this right after you mark a Payment as succeeded.
-     * Example from your Payment logic:
-     *   $payment->status = 'succeeded';
-     *   $payment->save();
-     *   JobController::notifyReceipt($job, $payment);
+     * Receipt (static helper you already call elsewhere)
      */
     public static function notifyReceipt(Job $job, $payment): void
     {
@@ -150,20 +168,17 @@ class JobController extends Controller
 
         try {
             if (class_exists(PaymentReceiptMail::class)) {
-                Mail::to($to)->send(new PaymentReceiptMail($job, $payment, $job->brand ?? null));
+                // IMPORTANT CHANGE: pass brand = null
+                Mail::to($to)->send(new PaymentReceiptMail($job, $payment, null));
             }
         } catch (\Throwable $e) {
             Log::error('Failed to send PaymentReceiptMail', [
-                'job_id'  => $job->getKey(),
-                'error'   => $e->getMessage(),
+                'job_id' => $job->getKey(),
+                'error'  => $e->getMessage(),
             ]);
         }
     }
 
-    /**
-     * Call this after placing an authorization hold.
-     * $releaseEta is a human string like 'usually 7–10 days'.
-     */
     public static function notifyHoldPlaced(Job $job, int $holdCents, string $currency, ?string $releaseEta = 'usually 7–10 days'): void
     {
         $to = optional($job->customer)->email ?? $job->customer_email ?? null;
@@ -171,21 +186,19 @@ class JobController extends Controller
 
         try {
             if (class_exists(HoldPlacedMail::class)) {
+                // IMPORTANT CHANGE: pass brand = null
                 Mail::to($to)->send(
-                    new HoldPlacedMail($job, $holdCents, $currency, $job->brand ?? null, $releaseEta)
+                    new HoldPlacedMail($job, $holdCents, $currency, null, $releaseEta)
                 );
             }
         } catch (\Throwable $e) {
             Log::error('Failed to send HoldPlacedMail', [
-                'job_id'  => $job->getKey(),
-                'error'   => $e->getMessage(),
+                'job_id' => $job->getKey(),
+                'error'  => $e->getMessage(),
             ]);
         }
     }
 
-    /**
-     * Call this after releasing a previous authorization hold.
-     */
     public static function notifyHoldReleased(Job $job, int $holdCents, string $currency): void
     {
         $to = optional($job->customer)->email ?? $job->customer_email ?? null;
@@ -193,14 +206,15 @@ class JobController extends Controller
 
         try {
             if (class_exists(HoldReleasedMail::class)) {
+                // IMPORTANT CHANGE: pass brand = null
                 Mail::to($to)->send(
-                    new HoldReleasedMail($job, $holdCents, $currency, $job->brand ?? null)
+                    new HoldReleasedMail($job, $holdCents, $currency, null)
                 );
             }
         } catch (\Throwable $e) {
             Log::error('Failed to send HoldReleasedMail', [
-                'job_id'  => $job->getKey(),
-                'error'   => $e->getMessage(),
+                'job_id' => $job->getKey(),
+                'error'  => $e->getMessage(),
             ]);
         }
     }
@@ -239,6 +253,7 @@ class JobController extends Controller
 
         $refHtml  = $this->escape($reference);
         $nameHtml = $this->escape($customerName);
+        $paySafe  = $this->escape($payUrl);
 
         return <<<HTML
 <!doctype html>
@@ -256,13 +271,13 @@ class JobController extends Controller
       {$noteHtml}
 
       <p style="margin:20px 0">
-        <a href="{$payUrl}" style="display:inline-block;padding:12px 18px;background:#16a34a;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
+        <a href="{$paySafe}" style="display:inline-block;padding:12px 18px;background:#16a34a;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
           Pay now
         </a>
       </p>
 
       <p style="margin:16px 0;color:#6b7280;font-size:12px">If the button doesn’t work, copy and paste this link into your browser:<br>
-        <span style="word-break:break-all;color:#374151">{$this->escape($payUrl)}</span>
+        <span style="word-break:break-all;color:#374151">{$paySafe}</span>
       </p>
 
       <p style="margin:24px 0 0;color:#111">Thanks,<br>The Team</p>
@@ -278,7 +293,7 @@ HTML;
         return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
 
-    private function respond(Request $request, int $status, string $message)
+    private function respond(Request $request, int $status, string $message): JsonResponse|RedirectResponse
     {
         if ($request->expectsJson()) {
             return response()->json([
